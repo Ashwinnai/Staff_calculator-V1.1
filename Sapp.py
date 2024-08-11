@@ -253,6 +253,8 @@ def main():
                                             if calls == 0:
                                                 continue
 
+                                            calls = float(calls)  # Convert calls to float
+
                                             positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, avg_aht, target, calls, interval)
 
                                             for requirement in positions_requirements:
@@ -349,6 +351,9 @@ def main():
                                     for interval, calls, aht in zip(intervals, st.session_state["calls_df"][day], aht_df[day]):
                                         if calls == 0 or aht == 0:
                                             continue
+
+                                        calls = float(calls)  # Convert calls to float
+                                        aht = float(aht)  # Ensure AHT is also a float
 
                                         positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, aht, target, calls, interval)
 
