@@ -5,6 +5,7 @@ from pyworkforce.queuing import MultiErlangC
 import io
 import re
 import time
+import numpy as np
 
 # Define the function to calculate staffing using MultiErlangC
 @st.cache_data
@@ -80,6 +81,20 @@ def adjust_weekly_distribution(distribution_data):
 
     return distribution_data
 
+# Function to validate numeric inputs and convert them to float safely
+def validate_and_convert_to_float(value, input_name):
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"Invalid input detected in {input_name}: '{value}' cannot be converted to a number. Please correct the input.")
+
+# Function to validate the inputs before performing calculations
+def validate_inputs(*args):
+    for i, value in enumerate(args):
+        if value is None or isinstance(value, str) or np.isnan(value):
+            return False, f"Invalid input detected: Input #{i+1} is not a valid number. Please check your input values."
+    return True, None
+
 # Main function of the Streamlit app
 def main():
     # Initialize days and intervals
@@ -111,38 +126,30 @@ def main():
     with st.sidebar.expander("User Inputs", expanded=False):
         acceptable_waiting_times_input = st.text_input("Acceptable Waiting Time (seconds, comma-separated)", "30")
         try:
-            acceptable_waiting_times = [float(awt) for awt in acceptable_waiting_times_input.split(',') if awt.strip().replace('.', '', 1).isdigit()]
-            if not acceptable_waiting_times:
-                raise ValueError
-        except ValueError:
-            st.error("Please provide valid numeric values for Acceptable Waiting Times.")
+            acceptable_waiting_times = [validate_and_convert_to_float(awt, "Acceptable Waiting Times") for awt in acceptable_waiting_times_input.split(',')]
+        except ValueError as e:
+            st.error(str(e))
             st.stop()
         
         shrinkages_input = st.text_input("Shrinkage (% , comma-separated)", "20")
         try:
-            shrinkages = [float(shrink) for shrink in shrinkages_input.split(',') if shrink.strip().replace('.', '', 1).isdigit()]
-            if not shrinkages:
-                raise ValueError
-        except ValueError:
-            st.error("Please provide valid numeric values for Shrinkage.")
+            shrinkages = [validate_and_convert_to_float(shrink, "Shrinkage") for shrink in shrinkages_input.split(',')]
+        except ValueError as e:
+            st.error(str(e))
             st.stop()
         
         max_occupancies_input = st.text_input("Max Occupancy (% , comma-separated)", "80")
         try:
-            max_occupancies = [float(occ) for occ in max_occupancies_input.split(',') if occ.strip().replace('.', '', 1).isdigit()]
-            if not max_occupancies:
-                raise ValueError
-        except ValueError:
-            st.error("Please provide valid numeric values for Max Occupancy.")
+            max_occupancies = [validate_and_convert_to_float(occ, "Max Occupancy") for occ in max_occupancies_input.split(',')]
+        except ValueError as e:
+            st.error(str(e))
             st.stop()
 
         service_level_targets_input = st.text_input("Service Level Targets (% , comma-separated)", "80")
         try:
-            service_level_targets = [float(target) for target in service_level_targets_input.split(',') if target.strip().replace('.', '', 1).isdigit()]
-            if not service_level_targets:
-                raise ValueError
-        except ValueError:
-            st.error("Please provide valid numeric values for Service Level Targets.")
+            service_level_targets = [validate_and_convert_to_float(target, "Service Level Targets") for target in service_level_targets_input.split(',')]
+        except ValueError as e:
+            st.error(str(e))
             st.stop()
 
         working_hours = st.number_input("Working Hours per Day", min_value=1.0, max_value=24.0, value=8.0, step=0.5)
@@ -156,11 +163,9 @@ def main():
         if aht_input_option == "Multiple AHT values for all intervals and days":
             average_handling_times_input = st.text_input("Average Handling Times (seconds, comma-separated)", "300")
             try:
-                average_handling_times = [float(aht) for aht in average_handling_times_input.split(',') if aht.strip().replace('.', '', 1).isdigit()]
-                if not average_handling_times:
-                    raise ValueError
-            except ValueError:
-                st.error("Please provide valid numeric values for Average Handling Times.")
+                average_handling_times = [validate_and_convert_to_float(aht, "Average Handling Times") for aht in average_handling_times_input.split(',')]
+            except ValueError as e:
+                st.error(str(e))
                 st.stop()
         else:
             average_handling_times = []
@@ -210,7 +215,11 @@ def main():
 
         for day, daily_volume in zip(days, daily_volumes):
             total_percentage = sum(adjusted_percentage_df[day])
-            calls_per_interval = [(daily_volume * (p / 100)) for p in adjusted_percentage_df[day]]
+            try:
+                calls_per_interval = [validate_and_convert_to_float(daily_volume * (p / 100), f"Calls for {day} during {interval}") for p, interval in zip(adjusted_percentage_df[day], intervals)]
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
             calls_df[day] = calls_per_interval
 
         st.session_state["calls_df"] = st.data_editor(calls_df, key="manual_calls_df_editor")
@@ -256,12 +265,27 @@ def main():
                                 scenario_name = f"Scenario {scenario_number}: AWT={awt}s, Shrinkage={shrinkage}%, Max Occupancy={max_occupancy}%, AHT={avg_aht}s, SLT={target}%"
                                 with st.expander(scenario_name, expanded=False):
                                     staffing_results = []
+                                    error_displayed = False  # Flag to track if an error was already shown
                                     for day in days:
                                         for interval, calls in zip(intervals, st.session_state["calls_df"][day]):
                                             if calls == 0:
                                                 continue
 
-                                            calls = float(calls)  # Convert calls to float
+                                            try:
+                                                calls = validate_and_convert_to_float(calls, f"Calls for {day} during {interval}")
+                                            except ValueError as e:
+                                                if not error_displayed:  # Display the error only once
+                                                    st.error(str(e))
+                                                    error_displayed = True
+                                                break  # Exit the loop to prevent further processing
+
+                                            # Validate inputs before calculating staffing
+                                            is_valid, error_message = validate_inputs(awt, shrinkage, max_occupancy, avg_aht, target, calls)
+                                            if not is_valid:
+                                                if not error_displayed:  # Display the error only once
+                                                    st.error(error_message)
+                                                    error_displayed = True
+                                                break  # Exit the loop to prevent further processing
 
                                             positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, avg_aht, target, calls, interval)
 
@@ -355,13 +379,28 @@ def main():
                             scenario_name = f"Scenario {scenario_number}: AWT={awt}s, Shrinkage={shrinkage}%, Max Occupancy={max_occupancy}%, SLT={target}%"
                             with st.expander(scenario_name, expanded=False):
                                 staffing_results = []
+                                error_displayed = False  # Flag to track if an error was already shown
                                 for day in days:
                                     for interval, calls, aht in zip(intervals, st.session_state["calls_df"][day], aht_df[day]):
                                         if calls == 0 or aht == 0:
                                             continue
 
-                                        calls = float(calls)  # Convert calls to float
-                                        aht = float(aht)  # Ensure AHT is also a float
+                                        try:
+                                            calls = validate_and_convert_to_float(calls, f"Calls for {day} during {interval}")
+                                            aht = validate_and_convert_to_float(aht, f"AHT for {day} during {interval}")
+                                        except ValueError as e:
+                                            if not error_displayed:  # Display the error only once
+                                                st.error(str(e))
+                                                error_displayed = True
+                                            break  # Exit the loop to prevent further processing
+
+                                        # Validate inputs before calculating staffing
+                                        is_valid, error_message = validate_inputs(awt, shrinkage, max_occupancy, aht, target, calls)
+                                        if not is_valid:
+                                            if not error_displayed:  # Display the error only once
+                                                st.error(error_message)
+                                                error_displayed = True
+                                            break  # Exit the loop to prevent further processing
 
                                         positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, aht, target, calls, interval)
 
@@ -453,9 +492,10 @@ def main():
         st.session_state["all_scenarios"] = all_scenarios  # Store scenarios in session state
 
         progress_bar.empty()
-
-        end_time = time.time()  # End timing
-        total_time = end_time - start_time  # Calculate total time taken
+# End timing
+        end_time = time.time()  
+        total_time = end_time - start_time  
+          # Calculate total time taken
         st.write(f"**Total Time Taken for All Scenarios:** {total_time:.2f} seconds")
 
         if all_scenarios:
