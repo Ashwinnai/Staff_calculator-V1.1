@@ -95,8 +95,16 @@ def main():
     # User Guide section in sidebar
     with st.sidebar.expander("User Guide", expanded=False):
         st.markdown("""
-        ## How to Use the Staffing Calculator App
-        (Include a detailed guide here)
+        ## Condensed User Guide
+
+        1. **Inputs:** Enter the acceptable waiting time, shrinkage, max occupancy, and service level targets in the sidebar.
+        2. **AHT:** Choose to input AHT values either for all intervals and days or at an interval level for each day.
+        3. **Volume Distribution:** Enter weekly call volume and adjust the percentage distribution across days and intervals.
+        4. **Scenarios:** Click "Calculate Staffing Requirements" to generate staffing scenarios.
+        5. **Review:** Review the generated scenarios, staffing requirements, heatmaps, and bar plots.
+        6. **Download Report:** Export the results as an Excel report by clicking the "Download Excel" button.
+
+        **Note:** The app retains your scenarios, comparisons, and summaries even after downloading the report.
         """)
 
     # User input parameters
@@ -237,7 +245,7 @@ def main():
         current_progress = 0
 
         scenario_number = 1
-        all_scenarios = {}  # Define the variable here
+        all_scenarios = st.session_state.get("all_scenarios", {})  # Retain previous scenarios
 
         for awt in acceptable_waiting_times:
             for shrinkage in shrinkages:
