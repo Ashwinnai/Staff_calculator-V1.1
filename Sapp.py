@@ -10,17 +10,28 @@ import numpy as np
 # Define the function to calculate staffing using MultiErlangC
 @st.cache_data
 def calculate_staffing(awt, shrinkage, max_occupancy, avg_aht, target, calls, interval):
-    param_grid = {"transactions": [calls], "aht": [avg_aht / 60], "interval": [30], "asa": [awt / 60], "shrinkage": [shrinkage / 100]}
+    param_grid = {
+        "transactions": [calls],
+        "aht": [avg_aht / 60],
+        "interval": [30],
+        "asa": [awt / 60],
+        "shrinkage": [shrinkage / 100],
+    }
     multi_erlang = MultiErlangC(param_grid=param_grid, n_jobs=-1)
-    required_positions_scenarios = {"service_level": [target / 100], "max_occupancy": [max_occupancy / 100]}
+    required_positions_scenarios = {
+        "service_level": [target / 100],
+        "max_occupancy": [max_occupancy / 100],
+    }
     return multi_erlang.required_positions(required_positions_scenarios)
 
 # Function to sanitize sheet names
+@st.cache_data
 def sanitize_sheet_name(sheet_name):
     return re.sub(r'[\\/*?:"<>|]', "_", sheet_name)
 
 # Function to generate Excel report
-def generate_excel(all_scenarios, comparison_df, summary_df):
+@st.cache_data
+def generate_excel(all_scenarios, summary_df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         for scenario_name, (staffing_df, total_staffing) in all_scenarios.items():
@@ -36,15 +47,13 @@ def generate_excel(all_scenarios, comparison_df, summary_df):
             staffing_pivot.to_excel(writer, sheet_name=short_name_staffing, index=True)
             total_staffing.to_excel(writer, sheet_name=short_name_summary)
 
-        # Export Comparison of Scenarios
-        comparison_df.to_excel(writer, sheet_name='Comparison of Scenarios', index=True)
-
         # Export Scenario Summary Table
         summary_df.to_excel(writer, sheet_name='Scenario Summary Table', index=True)
 
     return output
 
 # Function to adjust interval distribution to ensure it sums to 100% for each day
+@st.cache_data
 def adjust_interval_distribution(percentage_df):
     for day in percentage_df.columns:
         total_percentage = percentage_df[day].sum()
@@ -64,6 +73,7 @@ def adjust_interval_distribution(percentage_df):
     return percentage_df
 
 # Function to adjust weekly distribution
+@st.cache_data
 def adjust_weekly_distribution(distribution_data):
     total_percentage = distribution_data["Percentage"].sum()
 
@@ -82,13 +92,18 @@ def adjust_weekly_distribution(distribution_data):
     return distribution_data
 
 # Function to validate numeric inputs and convert them to float safely
+@st.cache_data
 def validate_and_convert_to_float(value, input_name):
     try:
-        return float(value)
+        result = float(value)
+        if np.isnan(result):
+            raise ValueError(f"Invalid input detected in {input_name}: '{value}' is NaN. Please correct the input.")
+        return result
     except ValueError:
         raise ValueError(f"Invalid input detected in {input_name}: '{value}' cannot be converted to a number. Please correct the input.")
 
-# Function to validate the inputs before performing calculations
+# Function to validate that inputs are not None, NaN, or strings
+@st.cache_data
 def validate_inputs(*args):
     for i, value in enumerate(args):
         if value is None or isinstance(value, str) or np.isnan(value):
@@ -118,8 +133,6 @@ def main():
         4. **Scenarios:** Click "Calculate Staffing Requirements" to generate staffing scenarios.
         5. **Review:** Review the generated scenarios, staffing requirements, heatmaps, and bar plots.
         6. **Download Report:** Export the results as an Excel report by clicking the "Download Excel" button.
-
-        **Note:** The app retains your scenarios, comparisons, and summaries even after downloading the report.
         """)
 
     # User input parameters
@@ -215,11 +228,7 @@ def main():
 
         for day, daily_volume in zip(days, daily_volumes):
             total_percentage = sum(adjusted_percentage_df[day])
-            try:
-                calls_per_interval = [validate_and_convert_to_float(daily_volume * (p / 100), f"Calls for {day} during {interval}") for p, interval in zip(adjusted_percentage_df[day], intervals)]
-            except ValueError as e:
-                st.error(str(e))
-                st.stop()
+            calls_per_interval = [(daily_volume * (p / 100)) for p in adjusted_percentage_df[day]]
             calls_df[day] = calls_per_interval
 
         st.session_state["calls_df"] = st.data_editor(calls_df, key="manual_calls_df_editor")
@@ -238,7 +247,6 @@ def main():
         if "aht_df" not in st.session_state:
             st.session_state["aht_df"] = aht_df
         st.session_state["aht_df"] = st.data_editor(st.session_state["aht_df"], key="aht_df_editor")
-        aht_df = st.session_state["aht_df"]
 
     if st.button("Calculate Staffing Requirements"):
         start_time = time.time()  # Start timing
@@ -265,27 +273,17 @@ def main():
                                 scenario_name = f"Scenario {scenario_number}: AWT={awt}s, Shrinkage={shrinkage}%, Max Occupancy={max_occupancy}%, AHT={avg_aht}s, SLT={target}%"
                                 with st.expander(scenario_name, expanded=False):
                                     staffing_results = []
-                                    error_displayed = False  # Flag to track if an error was already shown
                                     for day in days:
                                         for interval, calls in zip(intervals, st.session_state["calls_df"][day]):
                                             if calls == 0:
                                                 continue
 
+                                            # Ensure calls is a float
                                             try:
                                                 calls = validate_and_convert_to_float(calls, f"Calls for {day} during {interval}")
                                             except ValueError as e:
-                                                if not error_displayed:  # Display the error only once
-                                                    st.error(str(e))
-                                                    error_displayed = True
-                                                break  # Exit the loop to prevent further processing
-
-                                            # Validate inputs before calculating staffing
-                                            is_valid, error_message = validate_inputs(awt, shrinkage, max_occupancy, avg_aht, target, calls)
-                                            if not is_valid:
-                                                if not error_displayed:  # Display the error only once
-                                                    st.error(error_message)
-                                                    error_displayed = True
-                                                break  # Exit the loop to prevent further processing
+                                                st.error(str(e))
+                                                break
 
                                             positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, avg_aht, target, calls, interval)
 
@@ -379,28 +377,18 @@ def main():
                             scenario_name = f"Scenario {scenario_number}: AWT={awt}s, Shrinkage={shrinkage}%, Max Occupancy={max_occupancy}%, SLT={target}%"
                             with st.expander(scenario_name, expanded=False):
                                 staffing_results = []
-                                error_displayed = False  # Flag to track if an error was already shown
                                 for day in days:
                                     for interval, calls, aht in zip(intervals, st.session_state["calls_df"][day], aht_df[day]):
                                         if calls == 0 or aht == 0:
                                             continue
 
+                                        # Ensure calls and aht are floats
                                         try:
                                             calls = validate_and_convert_to_float(calls, f"Calls for {day} during {interval}")
                                             aht = validate_and_convert_to_float(aht, f"AHT for {day} during {interval}")
                                         except ValueError as e:
-                                            if not error_displayed:  # Display the error only once
-                                                st.error(str(e))
-                                                error_displayed = True
-                                            break  # Exit the loop to prevent further processing
-
-                                        # Validate inputs before calculating staffing
-                                        is_valid, error_message = validate_inputs(awt, shrinkage, max_occupancy, aht, target, calls)
-                                        if not is_valid:
-                                            if not error_displayed:  # Display the error only once
-                                                st.error(error_message)
-                                                error_displayed = True
-                                            break  # Exit the loop to prevent further processing
+                                            st.error(str(e))
+                                            break
 
                                         positions_requirements = calculate_staffing(awt, shrinkage, max_occupancy, aht, target, calls, interval)
 
@@ -485,32 +473,19 @@ def main():
                                     )
                                     st.plotly_chart(bar_plot)
 
-                                all_scenarios[scenario_name] = (staffing_df, total_staffing)
+                                    all_scenarios[scenario_name] = (staffing_df, total_staffing)
 
                             scenario_number += 1
 
         st.session_state["all_scenarios"] = all_scenarios  # Store scenarios in session state
 
         progress_bar.empty()
-# End timing
-        end_time = time.time()  
-        total_time = end_time - start_time  
-          # Calculate total time taken
+
+        end_time = time.time()  # End timing
+        total_time = end_time - start_time  # Calculate total time taken
         st.write(f"**Total Time Taken for All Scenarios:** {total_time:.2f} seconds")
 
         if all_scenarios:
-            st.header("Comparison of Scenarios")
-            comparison_df = pd.DataFrame()
-
-            for scenario, (staffing_df, total_staffing) in all_scenarios.items():
-                summary = total_staffing[["Required staff without Peak staffing", "Peak Staffing requirement"]].rename(
-                    columns={"Required staff without Peak staffing": "Required staff without Peak staffing", "Peak Staffing requirement": "Peak Staffing requirement"}
-                )
-                summary["Scenario"] = scenario
-                comparison_df = pd.concat([comparison_df, summary])
-
-            st.dataframe(comparison_df)
-
             st.header("Scenario Summary Table")
             summary_df = pd.DataFrame()
 
@@ -530,7 +505,7 @@ def main():
 
             # Export report
             st.markdown("## Download Your Report")
-            excel_data = generate_excel(all_scenarios, comparison_df, summary_df)
+            excel_data = generate_excel(all_scenarios, summary_df)
             st.download_button(
                 label="Download Excel",
                 data=excel_data.getvalue(),
