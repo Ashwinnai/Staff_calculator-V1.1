@@ -248,6 +248,11 @@ def main():
             st.session_state["aht_df"] = aht_df
         st.session_state["aht_df"] = st.data_editor(st.session_state["aht_df"], key="aht_df_editor")
 
+    # Track scenarios for the current session
+    if 'all_scenarios' not in st.session_state:
+        st.session_state['all_scenarios'] = {}  # Store all scenarios from previous runs
+    current_run_scenarios = {}  # Store only the scenarios for the current run
+
     if st.button("Calculate Staffing Requirements"):
         start_time = time.time()  # Start timing
         progress_bar = st.progress(0)
@@ -262,7 +267,6 @@ def main():
         current_progress = 0
 
         scenario_number = 1
-        all_scenarios = st.session_state.get("all_scenarios", {})  # Retain previous scenarios
 
         for awt in acceptable_waiting_times:
             for shrinkage in shrinkages:
@@ -368,7 +372,8 @@ def main():
                                         )
                                         st.plotly_chart(bar_plot)
 
-                                    all_scenarios[scenario_name] = (staffing_df, total_staffing)
+                                    # Store the current scenario results
+                                    current_run_scenarios[scenario_name] = (staffing_df, total_staffing)
                                     
                                 scenario_number += 1
 
@@ -378,7 +383,7 @@ def main():
                             with st.expander(scenario_name, expanded=False):
                                 staffing_results = []
                                 for day in days:
-                                    for interval, calls, aht in zip(intervals, st.session_state["calls_df"][day], aht_df[day]):
+                                    for interval, calls, aht in zip(intervals, st.session_state["calls_df"][day], st.session_state["aht_df"][day]):
                                         if calls == 0 or aht == 0:
                                             continue
 
@@ -473,11 +478,12 @@ def main():
                                     )
                                     st.plotly_chart(bar_plot)
 
-                                    all_scenarios[scenario_name] = (staffing_df, total_staffing)
+                                # Store the current scenario results
+                                current_run_scenarios[scenario_name] = (staffing_df, total_staffing)
 
                             scenario_number += 1
 
-        st.session_state["all_scenarios"] = all_scenarios  # Store scenarios in session state
+        st.session_state["all_scenarios"] = current_run_scenarios  # Update only with current scenarios
 
         progress_bar.empty()
 
@@ -485,11 +491,11 @@ def main():
         total_time = end_time - start_time  # Calculate total time taken
         st.write(f"**Total Time Taken for All Scenarios:** {total_time:.2f} seconds")
 
-        if all_scenarios:
+        if current_run_scenarios:
             st.header("Scenario Summary Table")
             summary_df = pd.DataFrame()
 
-            for scenario, (staffing_df, total_staffing) in all_scenarios.items():
+            for scenario, (staffing_df, total_staffing) in current_run_scenarios.items():
                 required_staff_without_peak = total_staffing["Required staff without Peak staffing"].max()  # Use max instead of sum
                 peak_staffing_requirement = total_staffing["Peak Staffing requirement"].max()
                 
@@ -505,7 +511,7 @@ def main():
 
             # Export report
             st.markdown("## Download Your Report")
-            excel_data = generate_excel(all_scenarios, summary_df)
+            excel_data = generate_excel(current_run_scenarios, summary_df)
             st.download_button(
                 label="Download Excel",
                 data=excel_data.getvalue(),
