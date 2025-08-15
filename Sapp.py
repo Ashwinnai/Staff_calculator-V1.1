@@ -7,6 +7,7 @@ import datetime
 import re
 import math
 import itertools
+import copy
 from ortools.sat.python import cp_model
 from pyworkforce.queuing import ErlangC, MultiErlangC
 import json
@@ -23,9 +24,9 @@ st.title("Multi-Channel WFM: Staffing, Scheduling & Costing")
 # --- Initialize Session State ---
 # Using .get() with a default value for safe initialization
 if "interval_freq" not in st.session_state:
-    st.session_state["interval_freq"] = "30T"
+    st.session_state["interval_freq"] = "30min"
 if "intervals" not in st.session_state:
-    st.session_state["intervals"] = [t.time() for t in pd.date_range("00:00", "23:30", freq="30T")]
+    st.session_state["intervals"] = [t.time() for t in pd.date_range("00:00", "23:30", freq="30min")]
 if "all_scenarios" not in st.session_state:
     st.session_state['all_scenarios'] = {}
 if "scenario_summary" not in st.session_state:
@@ -41,6 +42,12 @@ if 'adjusted_headcounts' not in st.session_state:
 if 'blended_volumes' not in st.session_state:
     st.session_state.blended_volumes = {}
 
+# --- State for What-If Simulations ---
+if 'what_if_simulations' not in st.session_state:
+    st.session_state.what_if_simulations = {}
+if 'active_what_if_simulation' not in st.session_state:
+    st.session_state.active_what_if_simulation = None
+
 # --- Default shifts now have duration, not unpaid break ---
 if 'shifts_df' not in st.session_state:
     st.session_state.shifts_df = pd.DataFrame([
@@ -51,9 +58,9 @@ if 'shifts_df' not in st.session_state:
 
 # --- State for Advanced Shift Optimization ---
 if 'duration_rules' not in st.session_state:
-    st.session_state.duration_rules = {}
+    st.session_state.duration_rules = {9.0: {'min_days': 5, 'max_days': 5, 'min_off': 2}}
 if 'allowed_durations' not in st.session_state:
-    st.session_state.allowed_durations = [8.0, 10.0]
+    st.session_state.allowed_durations = [9.0]
 if 'distribution_caps' not in st.session_state:
     st.session_state.distribution_caps = {}
 if 'shift_consistency_opt' not in st.session_state:
@@ -389,9 +396,29 @@ def calculate_erlang_c_positions(awt, shrinkage, max_occupancy, avg_aht, target,
     Calculates required positions and the resulting KPIs using MultiErlangC.
     This method finds the minimum positions to meet targets and returns the full performance dict.
     """
-    param_grid = {"transactions": [calls], "aht": [avg_aht / 60], "interval": [30], "asa": [awt / 60], "shrinkage": [shrinkage / 100]}
-    multi_erlang = MultiErlangC(param_grid=param_grid, n_jobs=-1)
-    return multi_erlang.required_positions({"service_level": [target / 100], "max_occupancy": [max_occupancy / 100]})
+    interval_seconds = pd.to_timedelta(st.session_state.interval_freq).total_seconds()
+    # MultiErlangC expects a grid of parameters to test. We are using it for a single calculation.
+    param_grid = {
+        "transactions": [calls],
+        "aht": [avg_aht],
+        "interval": [int(interval_seconds)],
+        "asa": [awt],
+        "service_level": [target / 100],  # Add service_level to param_grid
+        "shrinkage": [shrinkage / 100]
+    }
+    multi_erlang = MultiErlangC(param_grid=param_grid, n_jobs=1)
+
+    # The required_positions method expects a dictionary of scenarios.
+    required_positions_scenarios = {
+        "service_level": [target / 100],
+        "max_occupancy": [max_occupancy / 100]
+    }
+    
+    # This will return a list of dictionaries, one for each combination of scenarios.
+    # Since we have one of each, we get a list with a single dictionary.
+    results_list = multi_erlang.required_positions(required_positions_scenarios)
+    
+    return results_list
 
 def calculate_erlang_c_with_concurrency_positions(awt, shrinkage, max_occupancy, avg_aht, target, calls, concurrency):
     """
@@ -419,11 +446,14 @@ def calculate_aggregated_kpis(df_slice):
     Calculates volume-weighted KPIs for a given dataframe slice (e.g., a day or a week).
     """
     total_volume = df_slice["Volume"].sum()
+    working_hours = st.session_state.get('working_hours', 8.0)  # Default to 8 if not set
+
     if total_volume == 0:
         return {
             "Total Calls": 0, "Total Raw Positions": 0, "Total Final Positions": 0,
             "Service Level (%)": 100.0, "Occupancy (%)": 0.0,
-            "Wait Probability (%)": 0.0, "Overall ASA (s)": 0.0
+            "Wait Probability (%)": 0.0, "Overall ASA (s)": 0.0,
+            "Required HC per day": 0.0, "Required Raw per day": 0.0
         }
 
     # Safely get columns using .get() to provide a default value if the column doesn't exist.
@@ -433,14 +463,26 @@ def calculate_aggregated_kpis(df_slice):
     # Use the 'ASA_s' column for the overall average speed of answer
     weighted_asa = (df_slice.get('ASA_s', 0) * df_slice['Volume']).sum() / total_volume
 
+    raw_positions_sum = df_slice["raw_positions"].sum() if "raw_positions" in df_slice.columns else 0
+    
+    # Handle final_positions, falling back to Scheduled, and then to 0 if neither exist.
+    if "final_positions" in df_slice.columns:
+        final_positions_sum = df_slice["final_positions"].sum()
+    elif "Scheduled" in df_slice.columns:
+        final_positions_sum = df_slice["Scheduled"].sum()
+    else:
+        final_positions_sum = 0
+    
     return {
         "Total Calls": int(total_volume),
-        "Total Raw Positions": int(df_slice["raw_positions"].sum()),
-        "Total Final Positions": int(df_slice["final_positions"].sum()),
+        "Total Raw Positions": int(raw_positions_sum),
+        "Total Final Positions": int(final_positions_sum),
         "Service Level (%)": weighted_sl * 100,
         "Occupancy (%)": weighted_occ * 100,
         "Wait Probability (%)": weighted_wp * 100,
-        "Overall ASA (s)": weighted_asa
+        "Overall ASA (s)": weighted_asa,
+        "Required HC per day": (final_positions_sum / working_hours) if working_hours > 0 else 0,
+        "Required Raw per day": (raw_positions_sum / working_hours) if working_hours > 0 else 0
     }
 
 def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_day_name, volume_df):
@@ -488,7 +530,7 @@ def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_d
                     'occupancy': kpis.get('occupancy', 0),
                     'waiting_probability': wp,
                     'AWT_for_Queued_s': awt_for_queued,
-                    'ASA_s': awt_for_queued * wp, # The true overall ASA
+                    'ASA_s': awt_for_queued, # Directly use ASA from kpis for consistency
                 }
                 staffing_results.append({**result_row, **common_data})
 
@@ -508,6 +550,8 @@ def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_d
 # ------------------------------------------------------------------------------
 #                       SCHEDULING & COSTING CORE (OR-Tools)
 # ------------------------------------------------------------------------------
+
+# --- FIXED: Post-Schedule Performance Calculation ---
 
 # NEW: Interactive Constraint Analyzer Function
 def analyze_schedule_feasibility(req_matrix, headcount, schedule_mode, **kwargs):
@@ -629,7 +673,7 @@ def analyze_schedule_feasibility(req_matrix, headcount, schedule_mode, **kwargs)
 
 
     # Check 4: Rule Flexibility (WARNING/CRITICAL)
-    if schedule_mode == "Optimize Shifts Automatically":
+    if schedule_generation_mode == "Optimize Shifts Automatically":
         duration_rules = kwargs.get('duration_rules')
         for dur, rules in duration_rules.items():
             max_days = rules.get('max_days', 7)
@@ -1324,10 +1368,11 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
             yaxis_title='Cost ($)',
             legend_title='Cost Component'
         )
-        st.plotly_chart(fig_daily_cost, use_container_width=True)
+        st.plotly_chart(fig_daily_cost, use_container_width=True, key=f"{key_prefix}_daily_cost_chart")
 
 
     st.subheader("Generated Roster & Adherence")
+    # --- ADDED 'Performance Simulation' Tab ---
     tab_roster, tab_summary, tab_adherence = st.tabs(["Roster Table", "📊 Roster Summary", "📈 Line Adherence Analysis"])
     with tab_roster:
         st.dataframe(roster_df.set_index('Employee'))
@@ -1410,7 +1455,7 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
                 yaxis_title="Scheduled Staff",
                 legend_title="Shift Type"
             )
-            st.plotly_chart(fig_shift_coverage, use_container_width=True)
+            st.plotly_chart(fig_shift_coverage, use_container_width=True, key=f"{key_prefix}_shift_coverage_chart")
         else:
             st.info("No scheduled staff data to display shift coverage.")
 
@@ -1469,7 +1514,7 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
                 yaxis_title='Total Weekly Hours',
                 xaxis={'categoryorder':'total ascending'}
             )
-            st.plotly_chart(fig_hours_dist, use_container_width=True)
+            st.plotly_chart(fig_hours_dist, use_container_width=True, key=f"{key_prefix}_hours_dist_chart")
             download_dataframe_csv(weekly_hours_df, f"{key_prefix}_weekly_hours_distribution")
         else:
             st.info("No employee hours data to display.")
@@ -1658,8 +1703,6 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
         st.dataframe(interval_df, use_container_width=True, height=500)
         download_dataframe_csv(interval_df, f"{key_prefix}_interval_data")
 
-# ==============================================================================
-#                                 MAIN APP LAYOUT
 # ==============================================================================
 
 # --- NEW: Comprehensive Save/Load Configuration using CSV ---
@@ -2020,9 +2063,11 @@ with tab1:
                     scenario_name = params['scenario_name']
                     try:
                         vol_adj_percent = params.get('volume_adjustment', 100.0)
-                        adjusted_volume_df = base_volume_df * (vol_adj_percent / 100.0)
+                        # Ensure base_volume_df is numeric before multiplication
+                        numeric_base_volume_df = base_volume_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+                        adjusted_volume_df = numeric_base_volume_df * (vol_adj_percent / 100.0)
                         # Store adjusted volume for potential use in Tab 4
-                        params['base_volume_df'] = base_volume_df
+                        params['base_volume_df'] = numeric_base_volume_df
 
                         staffing_df = run_staffing_calculation(params, input_dates_str, day_name_map, st.session_state.week_start_day, adjusted_volume_df)
                         all_scenarios_results[scenario_name] = (staffing_df, params)
@@ -2267,10 +2312,8 @@ with tab1:
             "Required HC (Avg)": '{:.2f}',
             "Required HC for Peak Day": '{:.2f}',
             "Total Volume": '{:,.0f}',
-            "Weekly ASA (s)": '{:.2f}',
             "Weekly SL (%)": '{:.2f}%',
             "Weekly Occ. (%)": '{:.2f}%',
-            "Weekly Wait Prob. (%)": '{:.2f}%',
         }, na_rep="N/A"), use_container_width=True)
         download_dataframe_csv(st.session_state.scenario_summary, "scenario_summary_table")
 
@@ -2313,26 +2356,9 @@ with tab1:
                     st.dataframe(card_df, use_container_width=True)
                     download_dataframe_csv(card_df, f"compare_{key_suffix}_summary_card")
 
-                    st.markdown("##### Required Staffing Heatmap")
-                    y_labels = scenario_data['pivot'].index.map(lambda t: t.strftime('%H:%M'))
-                    fig_heatmap = go.Figure(data=go.Heatmap(
-                        z=scenario_data['pivot'].values.T,
-                        x=days_of_week_ordered,
-                        y=y_labels,
-                        colorscale='Viridis',
-                        hovertemplate='Day: %{x}<br>Time: %{y}<br>Required: %{z:.0f}<extra></extra>'))
-
-                    fig_heatmap.update_layout(
-                        title="Weekly Requirement",
-                        height=500, margin=dict(l=40, r=20, t=40, b=20)
-                    )
-                    fig_heatmap.update_yaxes(
-                        autorange='reversed',
-                        tickmode='array',
-                        tickvals=y_labels,
-                        ticktext=y_labels
-                    )
-                    st.plotly_chart(fig_heatmap, use_container_width=True, key=f"compare_heatmap_{key_suffix}")
+                    st.markdown("##### Daily Staffing Requirements by Interval")
+                    st.dataframe(scenario_data['pivot'].style.background_gradient(cmap='viridis'), use_container_width=True)
+                    download_dataframe_csv(scenario_data['pivot'], f"compare_{key_suffix}_staffing_requirements")
 
                     st.markdown("##### Total Required Staff-Intervals per Day")
                     st.dataframe(scenario_data['daily_totals'].apply(lambda x: f"{x:,.0f}").to_frame(name="Staff-Intervals"), use_container_width=True)
@@ -2352,25 +2378,9 @@ with tab1:
                     download_dataframe_csv(summary_diff_df, f"compare_{key_suffix}_summary_diff")
 
                     pivot_diff = data_B['pivot'] - data_A['pivot']
-                    st.markdown("##### Requirement Difference Heatmap")
-                    y_labels = pivot_diff.index.map(lambda t: t.strftime('%H:%M'))
-                    fig_diff_heatmap = go.Figure(data=go.Heatmap(
-                        z=pivot_diff.values.T,
-                        x=days_of_week_ordered,
-                        y=y_labels,
-                        colorscale='RdBu', zmid=0,
-                        hovertemplate='Day: %{x}<br>Time: %{y}<br>Difference: %{z:.0f}<extra></extra>'))
-
-                    fig_diff_heatmap.update_layout(
-                        title=title_name, height=500, margin=dict(l=40, r=20, t=40, b=20)
-                    )
-                    fig_diff_heatmap.update_yaxes(
-                        autorange='reversed',
-                        tickmode='array',
-                        tickvals=y_labels,
-                        ticktext=y_labels
-                    )
-                    st.plotly_chart(fig_diff_heatmap, use_container_width=True, key=f"compare_heatmap_{key_suffix}")
+                    st.markdown("##### Requirement Difference (Daily Interval Staffing)")
+                    st.dataframe(pivot_diff.style.background_gradient(cmap='RdBu', axis=None), use_container_width=True)
+                    download_dataframe_csv(pivot_diff, f"compare_{key_suffix}_staffing_difference")
 
                     daily_totals_diff = data_B['daily_totals'] - data_A['daily_totals']
                     st.markdown("##### Daily Staff-Intervals Difference")
@@ -2470,20 +2480,9 @@ with tab1:
                         fig.update_yaxes(title_text="<b>Volume</b>", secondary_y=True, showgrid=False)
                         st.plotly_chart(fig, use_container_width=True)
 
-                        st.markdown("##### Required Staffing Heatmap")
-                        fig_req_heatmap = go.Figure(data=go.Heatmap(
-                            z=req_pivot.values.T, x=days_of_week_ordered, y=intervals_str_fmt, colorscale='Viridis',
-                            hovertemplate='Day: %{x}<br>Time: %{y}<br>Required: %{z:.0f}<extra></extra>'))
-                        fig_req_heatmap.update_layout(
-                            title="Weekly Staffing Requirements (Total)", height=600
-                        )
-                        fig_req_heatmap.update_yaxes(
-                            autorange='reversed',
-                            tickmode='array',
-                            tickvals=intervals_str_fmt,
-                            ticktext=intervals_str_fmt
-                        )
-                        st.plotly_chart(fig_req_heatmap, use_container_width=True)
+                        st.markdown("##### Daily Staffing Requirements by Interval")
+                        st.dataframe(req_pivot.style.background_gradient(cmap='viridis'), use_container_width=True)
+                        download_dataframe_csv(req_pivot, f"staffing_requirements_{selected_scenario_for_detail}_{selected_week_for_detail}")
 
                         with st.expander("Peak Interval Analysis (Pareto)", expanded=False):
                             st.info("Identify the top intervals contributing to a certain percentage of the daily or weekly workload.")
@@ -2500,7 +2499,34 @@ with tab1:
                                     st.write("Weekly")
                                     st.dataframe(weekly_volume_pareto.drop(columns=['Week', 'CumulativePercentage']).reset_index(drop=True).style.format({'Contribution (%)': '{:.2f}%'}))
                                     download_dataframe_csv_no_index(weekly_volume_pareto.drop(columns=['Week', 'CumulativePercentage']).reset_index(drop=True), "weekly_volume_pareto")
-
+                                
+                                    # Weekly Volume Pareto Chart
+                                    st.markdown("##### Weekly Volume Distribution with Pareto Highlights")
+                                    if not weekly_df_copy.empty and 'Volume' in weekly_df_copy.columns:
+                                        # Group by Interval and sum Volume across all days of the week
+                                        weekly_total_volume_by_interval = weekly_df_copy.groupby('Interval')['Volume'].sum().reset_index()
+                                        weekly_total_volume_by_interval['IntervalStr'] = weekly_total_volume_by_interval['Interval'].apply(lambda t: t.strftime('%H:%M'))
+                                        
+                                        # Get intervals that are part of the Pareto for highlighting
+                                        pareto_volume_intervals = weekly_volume_pareto['Interval'].tolist()
+                                        weekly_total_volume_by_interval['color'] = np.where(weekly_total_volume_by_interval['IntervalStr'].isin(pareto_volume_intervals), 'orange', 'blue')
+                                        
+                                        fig_weekly_volume = go.Figure()
+                                        fig_weekly_volume.add_trace(go.Bar(
+                                            x=weekly_total_volume_by_interval['IntervalStr'],
+                                            y=weekly_total_volume_by_interval['Volume'],
+                                            marker_color=weekly_total_volume_by_interval['color'],
+                                            name='Volume'
+                                        ))
+                                        fig_weekly_volume.update_layout(
+                                            title="Weekly Volume Distribution with Pareto Highlights",
+                                            xaxis_title="Time Interval",
+                                            yaxis_title="Total Weekly Volume",
+                                            showlegend=False
+                                        )
+                                        st.plotly_chart(fig_weekly_volume, use_container_width=True)
+                                    else:
+                                       st.info("No weekly volume data to display Pareto chart.")
 
                                 pareto_day_vol = st.selectbox("Select Day for Volume Pareto", options=days_of_week_ordered, key="pareto_day_vol")
                                 day_df_vol = weekly_df[weekly_df['Day'] == pareto_day_vol]
@@ -2508,9 +2534,27 @@ with tab1:
                                     daily_volume_pareto = pareto_analysis(day_df_vol, 'Volume', 'Day', pareto_threshold)
                                     st.dataframe(daily_volume_pareto.drop(columns=['Day', 'CumulativePercentage']).reset_index(drop=True).style.format({'Contribution (%)': '{:.2f}%'}))
                                     download_dataframe_csv_no_index(daily_volume_pareto.drop(columns=['Day', 'CumulativePercentage']).reset_index(drop=True), f"{pareto_day_vol}_volume_pareto")
+                                    # Re-implemented Bar chart for Top Volume Intervals
+                                    day_df_for_chart = day_df_vol.copy()
+                                    pareto_intervals = daily_volume_pareto['Interval'].tolist()
+                                    day_df_for_chart['IntervalStr'] = day_df_for_chart['Interval'].apply(lambda t: t.strftime('%H:%M'))
+                                    day_df_for_chart['color'] = np.where(day_df_for_chart['IntervalStr'].isin(pareto_intervals), 'orange', 'blue')
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Bar(
+                                        x=day_df_for_chart['IntervalStr'],
+                                        y=day_df_for_chart['Volume'],
+                                        marker_color=day_df_for_chart['color'],
+                                        name='Volume'
+                                    ))
+                                    fig.update_layout(
+                                        title=f"Volume Analysis for {pareto_day_vol}",
+                                        xaxis_title="Time Interval",
+                                        yaxis_title="Volume",
+                                        showlegend=False
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
                                 else:
                                     st.info("No volume data for this day to perform Pareto analysis.")
-
                             with pareto_col2:
                                 st.markdown("##### 📈 Top Required Staff Intervals")
                                 if weekly_df_copy['final_positions'].sum() > 0:
@@ -2518,16 +2562,63 @@ with tab1:
                                     st.write("Weekly")
                                     st.dataframe(weekly_req_pareto.drop(columns=['Week', 'CumulativePercentage']).reset_index(drop=True).style.format({'Contribution (%)': '{:.2f}%'}))
                                     download_dataframe_csv_no_index(weekly_req_pareto.drop(columns=['Week', 'CumulativePercentage']).reset_index(drop=True), "weekly_req_pareto")
+                                
+                                    # Weekly Required Staff Pareto Chart
+                                    st.markdown("##### Weekly Required Staff Distribution with Pareto Highlights")
+                                    if not weekly_df_copy.empty and 'final_positions' in weekly_df_copy.columns:
+                                        # Group by Interval and sum final_positions across all days of the week
+                                        weekly_total_req_by_interval = weekly_df_copy.groupby('Interval')['final_positions'].sum().reset_index()
+                                        weekly_total_req_by_interval['IntervalStr'] = weekly_total_req_by_interval['Interval'].apply(lambda t: t.strftime('%H:%M'))
+                                        
+                                        # Get intervals that are part of the Pareto for highlighting
+                                        pareto_req_intervals = weekly_req_pareto['Interval'].tolist()
+                                        weekly_total_req_by_interval['color'] = np.where(weekly_total_req_by_interval['IntervalStr'].isin(pareto_req_intervals), 'orange', 'blue')
+                                        
+                                        fig_weekly_req = go.Figure()
+                                        fig_weekly_req.add_trace(go.Bar(
+                                            x=weekly_total_req_by_interval['IntervalStr'],
+                                            y=weekly_total_req_by_interval['final_positions'],
+                                            marker_color=weekly_total_req_by_interval['color'],
+                                            name='Required Staff'
+                                        ))
+                                        fig_weekly_req.update_layout(
+                                            title="Weekly Required Staff Distribution with Pareto Highlights",
+                                            xaxis_title="Time Interval",
+                                            yaxis_title="Total Weekly Required Staff",
+                                            showlegend=False
+                                        )
+                                        st.plotly_chart(fig_weekly_req, use_container_width=True)
+                                    else:
+                                       st.info("No weekly required staff data to display Pareto chart.")
+
                                 else:
                                     st.info("No required staff data for this week to perform Pareto analysis.")
-
-
                                 pareto_day_req = st.selectbox("Select Day for Requirement Pareto", options=days_of_week_ordered, key="pareto_day_req")
                                 day_df_req = weekly_df[weekly_df['Day'] == pareto_day_req]
                                 if not day_df_req.empty and day_df_req['final_positions'].sum() > 0:
                                     daily_req_pareto = pareto_analysis(day_df_req, 'final_positions', 'Day', pareto_threshold)
                                     st.dataframe(daily_req_pareto.drop(columns=['Day', 'CumulativePercentage']).reset_index(drop=True).style.format({'Contribution (%)': '{:.2f}%'}))
                                     download_dataframe_csv_no_index(daily_req_pareto.drop(columns=['Day', 'CumulativePercentage']).reset_index(drop=True), f"{pareto_day_req}_req_pareto")
+                                    
+                                    # Re-implemented Bar chart for Top Required Staff Intervals
+                                    day_df_for_chart = day_df_req.copy()
+                                    pareto_intervals = daily_req_pareto['Interval'].tolist()
+                                    day_df_for_chart['IntervalStr'] = day_df_for_chart['Interval'].apply(lambda t: t.strftime('%H:%M'))
+                                    day_df_for_chart['color'] = np.where(day_df_for_chart['IntervalStr'].isin(pareto_intervals), 'orange', 'blue')
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Bar(
+                                        x=day_df_for_chart['IntervalStr'],
+                                        y=day_df_for_chart['final_positions'],
+                                        marker_color=day_df_for_chart['color'],
+                                        name='Required Staff'
+                                    ))
+                                    fig.update_layout(
+                                        title=f"Required Staff Analysis for {pareto_day_req}",
+                                        xaxis_title="Time Interval",
+                                        yaxis_title="Required Staff",
+                                        showlegend=False
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
                                 else:
                                     st.info("No required staff data for this day to perform Pareto analysis.")
 
@@ -2548,6 +2639,19 @@ with tab1:
                             kpi_cols[5].metric("Weighted Occupancy", f"{weekly_kpis['Occupancy (%)']:.2f}%")
                             kpi_cols[6].metric("Weighted Wait Prob.", f"{weekly_kpis['Wait Probability (%)']:.2f}%")
 
+                            # Fetch and display the weekly HC metrics first
+                            summary_row = st.session_state.scenario_summary[
+                                (st.session_state.scenario_summary['Scenario'] == selected_scenario_for_detail) &
+                                (st.session_state.scenario_summary['Week_Start_Day'] == selected_week_for_detail)
+                            ]
+                            if not summary_row.empty:
+                                hc_avg = summary_row.iloc[0]['Required HC (Avg)']
+                                hc_peak = summary_row.iloc[0]['Required HC for Peak Day']
+                                hc_cols = st.columns(2)
+                                hc_cols[0].metric("Required HC (Avg)", f"{hc_avg:.2f}")
+                                hc_cols[1].metric("Required HC for Peak Day", f"{hc_peak:.2f}")
+
+
                             st.markdown("##### Daily Volume-Weighted KPIs")
                             daily_kpi_rows = []
                             for day in days_of_week_ordered:
@@ -2560,10 +2664,12 @@ with tab1:
                             if daily_kpi_rows:
                                 daily_kpi_df = pd.DataFrame(daily_kpi_rows).set_index("Day")
                                 st.dataframe(daily_kpi_df[[
-                                    "Total Calls", "Total Raw Positions", "Total Final Positions", "Service Level (%)",
-                                    "Occupancy (%)", "Wait Probability (%)", "Overall ASA (s)"
+                                    "Total Calls", "Total Raw Positions", "Total Final Positions",
+                                    "Required HC per day", "Required Raw per day", # New Columns
+                                    "Service Level (%)", "Occupancy (%)", "Wait Probability (%)", "Overall ASA (s)"
                                 ]].style.format({
                                     'Total Calls': '{:,.0f}', 'Total Raw Positions': '{:,.0f}', 'Total Final Positions': '{:,.0f}',
+                                    'Required HC per day': '{:.2f}', 'Required Raw per day': '{:.2f}', # Formatting
                                     'Service Level (%)': '{:.2f}%', 'Occupancy (%)': '{:.2f}%',
                                     'Wait Probability (%)': '{:.2f}%', 'Overall ASA (s)': '{:.2f}s'
                                 }), use_container_width=True)
@@ -2576,8 +2682,9 @@ with tab1:
                         st.markdown("##### Interval Level Data")
 
                         cols_to_show = ['Date', 'Day', 'Interval', 'Volume', 'raw_positions', 'final_positions']
+                        # Retain other columns for Erlang scenarios, but exclude problematic ASA/AWT
                         if is_erlang_scenario:
-                             cols_to_show.extend(['service_level', 'occupancy', 'waiting_probability', 'AWT_for_Queued_s', 'ASA_s'])
+                             cols_to_show.extend(['service_level', 'occupancy', 'waiting_probability'])
 
                         interval_detail_df = weekly_df.reindex(columns=cols_to_show).copy()
                         interval_detail_df['Interval'] = interval_detail_df['Interval'].apply(lambda t: t.strftime('%H:%M'))
@@ -2587,7 +2694,6 @@ with tab1:
                         }
                         if is_erlang_scenario:
                             format_dict.update({
-                                'AWT_for_Queued_s': '{:.2f}s', 'ASA_s': '{:.2f}s',
                                 'service_level': '{:.2%}', 'occupancy': '{:.2%}',
                                 'waiting_probability': '{:.2%}'
                             })
@@ -2681,6 +2787,11 @@ with tab2:
                 "Set the daily start and end times within which all optimized shifts must fall. "
                 "**For 24/7 operations on a specific day, set both Start and End Time to 00:00.**"
             )
+            if st.button("Set All Days to 24/7 Operation", key="set_24_7_op_hours"):
+                for day in DAYS_OF_WEEK_OPTIONS:
+                    st.session_state.daily_op_hours[day] = {"Start Time": datetime.time(0, 0), "End Time": datetime.time(0, 0)}
+                st.rerun()
+
             op_hours_df = pd.DataFrame.from_dict(st.session_state.daily_op_hours, orient='index')
             edited_op_hours_df = st.data_editor(
                 op_hours_df,
@@ -3394,8 +3505,8 @@ with tab3:
                                 "Cost/Sched Hour": np.nan, "Cost/Req Hour": np.nan, "Cost/Transaction": np.nan})
                 summary_data.append(row)
 
-                if summary_data:
-                    summary_display_df = pd.DataFrame(summary_data)
+        if summary_data:
+            summary_display_df = pd.DataFrame(summary_data)
             cols_order = [
                 "Scenario", "Week Starting", "Model Type", "Status", "Total Cost",
                 "Cost/Sched Hour", "Cost/Req Hour", "Cost/Transaction",
@@ -3407,7 +3518,6 @@ with tab3:
 
             final_cols = [col for col in cols_order if col in summary_display_df.columns]
             summary_display_df = summary_display_df[final_cols]
-
 
             st.dataframe(summary_display_df.style.format({
                 'Total Cost': '${:,.2f}', 'Base Cost': '${:,.2f}', 'OT Cost': '${:,.2f}',
@@ -3422,6 +3532,8 @@ with tab3:
 
     else:
         st.info("Generate weekly rosters on Tab 2 to see a summary here.")
+
+    st.markdown("---")
 
     st.markdown("---")
     st.header("Head-to-Head Scenario Comparison")
@@ -3477,7 +3589,9 @@ with tab3:
                     vto_hours = over * interval_duration_hours
                     ot_needed_hours = under * interval_duration_hours
 
-                    adherence_cap = data.get('solution', {}).get('config', {}).get('cap_percent', 105)
+                    config_dict = (data.get('solution') or {}).get('config') or {}
+                    adherence_cap = config_dict.get('cap_percent', 105)
+                    
                     adherence_metrics = calculate_adherence_metrics(req_matrix, sched_matrix, adherence_cap, day_order)
 
                     kpi_data = {
@@ -3566,206 +3680,320 @@ with tab4:
     if not forecast_data:
         st.warning("No forecast scenarios found. Please run a staffing calculation on Tab 1 to enable this feature.", icon="⚠️")
     else:
-        # Create a list of available forecasts to choose from
-        forecast_options = list(forecast_data.keys())
-        selected_scenario_name = st.selectbox(
-            "Select a baseline forecast scenario to simulate:",
-            options=forecast_options,
-            index=0,
-            key="what_if_forecast_selection"
-        )
+        left_col, right_col = st.columns(2)
 
-        # Get the data for the selected scenario
-        baseline_staffing_df, baseline_params = forecast_data[selected_scenario_name]
-        is_blended = 'channels' in baseline_params
-
-        # Allow user to select a specific week from the chosen scenario
-        week_start_options = sorted(baseline_staffing_df['Week_Start_Day'].dt.strftime('%Y-%m-%d').unique())
-        if not week_start_options:
-             st.warning("No weekly data available for the selected scenario.")
-             st.stop()
-
-        selected_week_str = st.selectbox(
-            "Select a week to simulate:",
-            options=week_start_options,
-            key="what_if_week_selection"
-        )
-        week_start_dt = datetime.datetime.strptime(selected_week_str, '%Y-%m-%d').date()
-
-        st.markdown("#### Simulation Controls")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            volume_percent = st.slider("Volume Fluctuation (%)", -100, 100, 0, 5, key="what_if_volume", help="Increases or decreases the original contact volume forecast.")
-        with c2:
-            aht_percent = st.slider("AHT Fluctuation (%)", -50, 50, 0, 5, key="what_if_aht", help="Increases or decreases the original AHT forecast.")
-        with c3:
-            # For shrinkage, an absolute change is more intuitive than percentage
-            shrink_adj = st.slider("Shrinkage Adjustment (Absolute %)", -20.0, 20.0, 0.0, 0.5, key="what_if_shrink", help="Adds or subtracts from the original shrinkage percentage. E.g., if original is 30% and slider is +5%, new shrinkage is 35%.")
-
-        # --- Recalculate the forecast based on slider inputs ---
-        with st.spinner("Recalculating forecast based on new inputs..."):
-            # Create a deep copy of the original params to modify for the simulation
-            sim_params = json.loads(json.dumps(baseline_params, default=str)) # A trick to deepcopy un-jsonable items
-
-            # Get the date range for the selected week
-            week_dates_str = [(week_start_dt + datetime.timedelta(days=d)).strftime('%Y-%m-%d') for d in range(7)]
-            week_day_map = {date_str: pd.to_datetime(date_str).strftime('%A') for date_str in week_dates_str}
-
-            # Handle single vs. blended scenarios
-            if not is_blended:
-                 # Single Channel
-                sim_params['aht'] *= (1 + aht_percent / 100.0)
-                sim_params['shrinkage'] += shrink_adj
-                base_volume_df = sim_params.pop('base_volume_df', None)
-                if base_volume_df is None:
-                    # Fallback: derive base volume from original staffing df if not stored
-                    st.warning("Could not find original base volume, deriving from calculated forecast. Volume simulation might be slightly off.", icon="⚠️")
-                    weekly_base_df = baseline_staffing_df[baseline_staffing_df['Week_Start_Day'] == pd.to_datetime(week_start_dt)]
-                    base_volume_df = weekly_base_df.pivot_table(index='Interval', columns='Date', values='Volume').rename(columns=lambda x: x.strftime('%Y-%m-%d'))
-                    base_volume_df = base_volume_df.reindex(columns=week_dates_str).fillna(0)
-                    base_volume_df.index = [t.strftime('%H:%M:%S') for t in base_volume_df.index]
-                sim_volume_df = base_volume_df * (1 + volume_percent / 100.0)
-
-                sim_staffing_df = run_staffing_calculation(sim_params, week_dates_str, week_day_map, st.session_state.week_start_day, sim_volume_df)
-            else:
-                 # Blended Channel - re-run the original logic with modified params
-                 for ch in sim_params['channel_params']:
-                     sim_params['channel_params'][ch]['aht'] *= (1 + aht_percent / 100.0)
-                     sim_params['channel_params'][ch]['shrinkage'] += shrink_adj
-
-                 adjusted_volume_dfs = {}
-                 for ch, df_json in sim_params['volume_dfs'].items():
-                     # The volume_dfs might be stored as JSON, need to convert back
-                     base_vol_df = pd.read_json(StringIO(df_json), orient='split') if isinstance(df_json, str) else df_json
-                     adjusted_volume_dfs[ch] = base_vol_df.copy() * (1 + volume_percent / 100.0)
-
-                 if sim_params.get('erlang_only'):
-                      # Logic for Erlang-only blend
-                      # ... [This part is complex and omitted for brevity, but would mirror the Tab 1 calc]
-                      # For simplicity, we'll assume the AHT/Shrinkage change applies to the blended average
-                      st.info("Simulating blended Erlang scenarios is not fully supported yet. AHT/Shrinkage changes are applied to the blended average.")
-                      sim_staffing_df = baseline_staffing_df.copy() # Placeholder
-                 else:
-                      # Logic for Sum-of-Parts blend
-                      total_reqs_df = pd.DataFrame(0.0, index=interval_index_str, columns=week_dates_str)
-                      total_volume_df = pd.DataFrame(0.0, index=interval_index_str, columns=week_dates_str)
-                      for ch_name in sim_params['channels']:
-                           params = sim_params['channel_params'][ch_name]
-                           params['channel_type'] = CHANNEL_OPTIONS[ch_name]
-                           vol_df = adjusted_volume_dfs[ch_name]
-                           total_volume_df += vol_df
-                           channel_staffing_df = run_staffing_calculation(params, week_dates_str, week_day_map, st.session_state.week_start_day, vol_df)
-                           req_pivot = channel_staffing_df.pivot_table(index='Interval', columns='Date', values='final_positions', fill_value=0)
-                           req_pivot.index = [t.strftime('%H:%M:%S') for t in req_pivot.index]
-                           req_pivot.columns = req_pivot.columns.strftime('%Y-%m-%d')
-                           req_pivot = req_pivot.reindex(index=interval_index_str, columns=week_dates_str).fillna(0)
-                           total_reqs_df += req_pivot
-
-                      total_reqs_long = total_reqs_df.reset_index().melt(id_vars='index', var_name='Date', value_name='final_positions')
-                      total_reqs_long.rename(columns={'index': 'Interval_str'}, inplace=True)
-                      total_reqs_long['Date'] = pd.to_datetime(total_reqs_long['Date'])
-                      time_map = {t.strftime('%H:%M:%S'): t for t in intervals_list}
-                      total_reqs_long['Interval'] = total_reqs_long['Interval_str'].map(time_map)
-                      total_volume_long = total_volume_df.reset_index().melt(id_vars='index', var_name='Date', value_name='Volume')
-                      total_reqs_long['Volume'] = total_volume_long['Volume']
-                      sim_staffing_df = total_reqs_long
-
-        # --- Process and Display Results ---
-        def process_forecast_output(staffing_df, week_start_dt):
-            """Helper to extract KPIs and pivot from a forecast df."""
-            week_df = staffing_df[staffing_df['Date'].dt.date >= week_start_dt].copy()
-            week_df = week_df[week_df['Date'].dt.date < (week_start_dt + datetime.timedelta(days=7))]
-
-            if week_df.empty:
-                return None
-
-            req_pivot = week_df.pivot_table(index='Interval', columns='Date', values='final_positions', fill_value=0)
-            week_dates = pd.to_datetime([(week_start_dt + datetime.timedelta(days=d)) for d in range(7)])
-            req_pivot = req_pivot.reindex(columns=week_dates, fill_value=0)
-            req_pivot = req_pivot.reindex(index=st.session_state.intervals, fill_value=0)
-
-            fte_metrics = calculate_fte_metrics_from_matrix(
-                req_pivot.T.values.tolist(), st.session_state.working_hours, st.session_state.working_days
+        with left_col:
+            st.subheader("Simulation Controls")
+            # Create a list of available forecasts to choose from
+            forecast_options = list(forecast_data.keys())
+            selected_scenario_name = st.selectbox(
+                "Select a baseline forecast scenario to simulate:",
+                options=forecast_options,
+                index=0,
+                key="what_if_forecast_selection"
             )
-            total_volume = week_df['Volume'].sum()
-            kpis = {'Total Volume': total_volume, **fte_metrics}
 
-            if 'service_level' in week_df.columns:
-                weekly_agg_kpis = calculate_aggregated_kpis(week_df)
-                kpis.update({
-                    "Service Level (%)": weekly_agg_kpis["Service Level (%)"],
-                    "Overall ASA (s)": weekly_agg_kpis["Overall ASA (s)"],
-                    "Occupancy (%)": weekly_agg_kpis["Occupancy (%)"],
+            # Get the data for the selected scenario
+            baseline_staffing_df, baseline_params = forecast_data[selected_scenario_name]
+            is_blended = 'channels' in baseline_params
+
+            # Allow user to select a specific week from the chosen scenario
+            week_start_options = sorted(baseline_staffing_df['Week_Start_Day'].dt.strftime('%Y-%m-%d').unique())
+            if not week_start_options:
+                 st.warning("No weekly data available for the selected scenario.")
+                 st.stop()
+
+            selected_week_str = st.selectbox(
+                "Select a week to simulate:",
+                options=week_start_options,
+                key="what_if_week_selection"
+            )
+            
+            volume_percent = st.slider("Volume Fluctuation (%)", -100, 100, 0, 5, key="what_if_volume", help="Increases or decreases the original contact volume forecast.")
+            aht_percent = st.slider("AHT Fluctuation (%)", -50, 50, 0, 5, key="what_if_aht", help="Increases or decreases the original AHT forecast.")
+            shrink_adj = st.slider("Shrinkage Adjustment (Absolute %)", -20.0, 20.0, 0.0, 0.5, key="what_if_shrink", help="Adds or subtracts from the original shrinkage percentage. E.g., if original is 30% and slider is +5%, new shrinkage is 35%.")
+            week_start_dt = datetime.datetime.strptime(selected_week_str, '%Y-%m-%d').date()
+
+        with right_col:
+            st.subheader("Simulation Results")
+            # --- Recalculate the forecast based on slider inputs ---
+            with st.spinner("Recalculating forecast based on new inputs..."):
+                simulated_params = copy.deepcopy(baseline_params)
+                volume_multiplier = 1 + (volume_percent / 100.0)
+                if not is_blended:
+                    simulated_params['volume_adjustment'] = simulated_params.get('volume_adjustment', 100) * volume_multiplier
+                else:
+                    pass
+                aht_multiplier = 1 + (aht_percent / 100.0)
+                if not is_blended:
+                    simulated_params['aht'] = simulated_params['aht'] * aht_multiplier
+                else:
+                    for ch_name in simulated_params['channel_params']:
+                        simulated_params['channel_params'][ch_name]['aht'] = simulated_params['channel_params'][ch_name]['aht'] * aht_multiplier
+                if not is_blended:
+                    original_shrinkage = simulated_params.get('shrinkage', 0)
+                    simulated_params['shrinkage'] = max(0, min(99.9, original_shrinkage + shrink_adj))
+                else:
+                    for ch_name in simulated_params['channel_params']:
+                        original_shrinkage = simulated_params['channel_params'][ch_name].get('shrinkage', 0)
+                        simulated_params['channel_params'][ch_name]['shrinkage'] = max(0, min(99.9, original_shrinkage + shrink_adj))
+                week_mask = (baseline_staffing_df['Week_Start_Day'] == pd.Timestamp(week_start_dt))
+                baseline_week_df = baseline_staffing_df[week_mask].copy()
+
+                if not is_blended:
+                    week_dates = baseline_week_df['Date'].dt.strftime('%Y-%m-%d').unique()
+                    day_name_map_sim = {date: pd.to_datetime(date).strftime('%A') for date in week_dates}
+                    volume_data = {}
+                    for date in week_dates:
+                        date_obj = pd.to_datetime(date)
+                        volume_data[date] = baseline_week_df[baseline_week_df['Date'] == date_obj].set_index('Interval')['Volume'] * volume_multiplier
+                    volume_df_sim = pd.DataFrame(volume_data)
+                    volume_df_sim.index = baseline_week_df[baseline_week_df['Date'] == pd.to_datetime(week_dates[0])]['Interval'].values
+                    simulated_staffing_df = run_staffing_calculation(simulated_params, week_dates, day_name_map_sim, st.session_state.week_start_day, volume_df_sim)
+                else:
+                    simulated_staffing_df = baseline_week_df.copy()
+                    simulated_staffing_df['Volume'] = simulated_staffing_df['Volume'] * volume_multiplier
+                    simulated_staffing_df['AHT'] = simulated_staffing_df['AHT'] * aht_multiplier
+                    simulated_staffing_df['Simulated Shrinkage Adjustment'] = shrink_adj
+                if not is_blended:
+                    req_pivot_sim = simulated_staffing_df.pivot_table(index='Interval', columns='Date', values='final_positions', fill_value=0)
+                else:
+                    req_pivot_sim = simulated_staffing_df.pivot_table(index='Interval', columns='Date', values='final_positions', fill_value=0)
+                req_pivot_sim = req_pivot_sim.reindex(index=st.session_state.intervals, fill_value=0)
+                week_dates_dt = pd.to_datetime(week_dates) if not is_blended else simulated_staffing_df['Date'].unique()
+                req_pivot_sim = req_pivot_sim.reindex(columns=sorted(week_dates_dt), fill_value=0)
+                days_of_week_ordered_sim = [pd.to_datetime(date).strftime('%A') for date in sorted(week_dates)]
+                if not is_blended:
+                    volume_pivot_sim = simulated_staffing_df.pivot_table(index='Interval', columns='Date', values='Volume', fill_value=0)
+                    volume_pivot_sim = volume_pivot_sim.reindex(index=st.session_state.intervals, fill_value=0)
+                    volume_pivot_sim = volume_pivot_sim.reindex(columns=sorted(week_dates_dt), fill_value=0)
+                else:
+                    volume_pivot_sim = simulated_staffing_df.pivot_table(index='Interval', columns='Date', values='Volume', fill_value=0)
+                    volume_pivot_sim = volume_pivot_sim.reindex(index=st.session_state.intervals, fill_value=0)
+                    volume_pivot_sim = volume_pivot_sim.reindex(columns=sorted(simulated_staffing_df['Date'].unique()), fill_value=0)
+
+            # Get baseline data for comparison
+            baseline_week_mask = (baseline_staffing_df['Week_Start_Day'] == pd.Timestamp(week_start_dt))
+            baseline_week_df_comp = baseline_staffing_df[baseline_week_mask].copy()
+            req_pivot_baseline = baseline_week_df_comp.pivot_table(index='Interval', columns='Date', values='final_positions', fill_value=0)
+            req_pivot_baseline = req_pivot_baseline.reindex(index=st.session_state.intervals, fill_value=0)
+            req_pivot_baseline = req_pivot_baseline.reindex(columns=sorted(week_dates_dt), fill_value=0)
+            volume_pivot_baseline = baseline_week_df_comp.pivot_table(index='Interval', columns='Date', values='Volume', fill_value=0)
+            volume_pivot_baseline = volume_pivot_baseline.reindex(index=st.session_state.intervals, fill_value=0)
+            volume_pivot_baseline = volume_pivot_baseline.reindex(columns=sorted(week_dates_dt), fill_value=0)
+            req_diff = req_pivot_sim - req_pivot_baseline
+            volume_diff = volume_pivot_sim - volume_pivot_baseline
+            intervals_str_fmt = [t.strftime('%H:%M') for t in st.session_state.intervals]
+            
+            # Display summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            total_baseline_req = req_pivot_baseline.sum().sum()
+            total_simulated_req = req_pivot_sim.sum().sum()
+            req_change = ((total_simulated_req - total_baseline_req) / total_baseline_req) * 100 if total_baseline_req > 0 else 0
+            total_baseline_vol = volume_pivot_baseline.sum().sum()
+            total_simulated_vol = volume_pivot_sim.sum().sum()
+            vol_change = ((total_simulated_vol - total_baseline_vol) / total_baseline_vol) * 100 if total_baseline_vol > 0 else 0
+            col1.metric("Total Required Staff", f"{total_simulated_req:,.0f}", f"{req_change:.1f}%")
+            col2.metric("Total Volume", f"{total_simulated_vol:,.0f}", f"{vol_change:.1f}%")
+            if not is_blended:
+                baseline_aht = baseline_params.get('aht', 0)
+                simulated_aht = simulated_params.get('aht', 0)
+                aht_change = ((simulated_aht - baseline_aht) / baseline_aht) * 100 if baseline_aht > 0 else 0
+                col3.metric("AHT", f"{simulated_aht:.1f}s", f"{aht_change:.1f}%")
+            else:
+                col3.metric("AHT Change", f"{aht_percent}%", "Multi-channel")
+            if not is_blended:
+                baseline_shrinkage = baseline_params.get('shrinkage', 0)
+                simulated_shrinkage = simulated_params.get('shrinkage', 0)
+                shrinkage_change = simulated_shrinkage - baseline_shrinkage
+                col4.metric("Shrinkage", f"{simulated_shrinkage:.1f}%", f"{shrinkage_change:+.1f}%")
+            else:
+                col4.metric("Shrinkage Change", f"{shrink_adj:+.1f}%", "Multi-channel")
+            
+            # --- Organize outputs into tabs ---
+            tab_summary, tab_charts, tab_params, tab_interval_tables, tab_heatmaps = st.tabs([
+                "📊 Summary KPIs", "📈 Comparison Charts", "📋 Parameter Details", "🗓️ Interval Staffing Tables", "🔥 Difference Heatmaps"
+            ])
+
+            with tab_summary:
+                st.subheader("Key Performance Indicator Summary")
+                st.info("This table compares the key headcount metrics between the baseline forecast and your simulated scenario for the selected week.")
+
+                working_hours = st.session_state.get('working_hours', 8.0)
+                working_days = st.session_state.get('working_days', 5.0)
+                interval_duration_hours = pd.to_timedelta(st.session_state.interval_freq).total_seconds() / 3600
+
+                # --- Calculate Baseline Metrics ---
+                baseline_fte_metrics = calculate_fte_metrics_from_matrix(req_pivot_baseline.T.values.tolist(), working_hours, working_days)
+                baseline_daily_hours = req_pivot_baseline.sum(axis=0) * interval_duration_hours
+                baseline_daily_hc = baseline_daily_hours / working_hours if working_hours > 0 else pd.Series(0.0, index=baseline_daily_hours.index)
+
+                # --- Calculate Simulated Metrics ---
+                simulated_fte_metrics = calculate_fte_metrics_from_matrix(req_pivot_sim.T.values.tolist(), working_hours, working_days)
+                simulated_daily_hours = req_pivot_sim.sum(axis=0) * interval_duration_hours
+                simulated_daily_hc = simulated_daily_hours / working_hours if working_hours > 0 else pd.Series(0.0, index=simulated_daily_hours.index)
+
+                # --- Construct Summary DataFrame ---
+                summary_rows = []
+                summary_rows.append({
+                    "Metric": "Weekly Required HC (Avg)",
+                    "Baseline": baseline_fte_metrics['avg_fte'],
+                    "Simulated": simulated_fte_metrics['avg_fte']
+                })
+                summary_rows.append({
+                    "Metric": "Required HC for Peak Day",
+                    "Baseline": baseline_fte_metrics['peak_fte'],
+                    "Simulated": simulated_fte_metrics['peak_fte']
                 })
 
-            return {'kpis': kpis, 'pivot': req_pivot}
+                # Add daily HC, ensuring correct day names
+                for day_date in sorted(baseline_daily_hc.index):
+                    day_name = day_date.strftime('%A')
+                    summary_rows.append({
+                        "Metric": f"Daily Required HC ({day_name})",
+                        "Baseline": baseline_daily_hc.get(day_date, 0),
+                        "Simulated": simulated_daily_hc.get(day_date, 0)
+                    })
 
-        def display_what_if_card(column, data, title, key_suffix):
-            """Helper to display a KPI card and heatmap."""
-            with column:
-                st.subheader(title)
-                if data:
-                    kpi_df = pd.DataFrame.from_dict(data['kpis'], orient='index', columns=['Value'])
-                    st.dataframe(kpi_df.style.format("{:,.2f}"), use_container_width=True)
-                    st.markdown("###### Requirement Heatmap")
-                    fig_heatmap = go.Figure(data=go.Heatmap(
-                        z=data['pivot'].values,
-                        x=data['pivot'].columns.strftime('%A'),
-                        y=[t.strftime('%H:%M') for t in data['pivot'].index],
-                        colorscale='Viridis',
-                        hovertemplate='Day: %{x}<br>Time: %{y}<br>Required: %{z:.0f}<extra></extra>'
-                    ))
-                    fig_heatmap.update_layout(height=400, margin=dict(l=20,r=20,t=20,b=20))
-                    fig_heatmap.update_yaxes(autorange='reversed')
-                    st.plotly_chart(fig_heatmap, use_container_width=True, key=f"whatif_heatmap_{key_suffix}")
+                # Separate weekly and daily metrics
+                weekly_summary_rows = []
+                daily_summary_rows = []
+
+                for row in summary_rows:
+                    if "Weekly" in row["Metric"] or "Peak Day" in row["Metric"]:
+                        weekly_summary_rows.append(row)
+                    else:
+                        daily_summary_rows.append(row)
+
+                weekly_summary_df = pd.DataFrame(weekly_summary_rows).set_index("Metric")
+                weekly_summary_df['Difference'] = weekly_summary_df['Simulated'] - weekly_summary_df['Baseline']
+                weekly_summary_df['Difference (%)'] = (weekly_summary_df['Difference'] / weekly_summary_df['Baseline']).replace([np.inf, -np.inf], 0).fillna(0) * 100
+
+                daily_summary_df = pd.DataFrame(daily_summary_rows).set_index("Metric")
+                daily_summary_df['Difference'] = daily_summary_df['Simulated'] - daily_summary_df['Baseline']
+                daily_summary_df['Difference (%)'] = (daily_summary_df['Difference'] / daily_summary_df['Baseline']).replace([np.inf, -np.inf], 0).fillna(0) * 100
+
+                st.markdown("##### Weekly Required HC")
+                st.dataframe(weekly_summary_df.style.format({
+                    'Baseline': '{:.2f}',
+                    'Simulated': '{:.2f}',
+                    'Difference': '{:+.2f}',
+                    'Difference (%)': '{:+.2f}%'
+                }), use_container_width=True)
+                download_dataframe_csv(weekly_summary_df, f"whatif_weekly_hc_summary_{selected_scenario_name}_{selected_week_str}")
+
+                st.markdown("##### Daily Required HC")
+                st.dataframe(daily_summary_df.style.format({
+                    'Baseline': '{:.2f}',
+                    'Simulated': '{:.2f}',
+                    'Difference': '{:+.2f}',
+                    'Difference (%)': '{:+.2f}%'
+                }), use_container_width=True)
+                download_dataframe_csv(daily_summary_df, f"whatif_daily_hc_summary_{selected_scenario_name}_{selected_week_str}")
+
+
+            with tab_charts:
+                st.markdown("##### Staffing Requirement Comparison")
+                fig_comp_req = make_subplots(rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=days_of_week_ordered)
+                for i, day_name in enumerate(days_of_week_ordered):
+                    day_date_for_plotting = sorted(week_dates_dt)[i]
+                    # Ensure the column exists before trying to access it
+                    if pd.Timestamp(day_date_for_plotting) in req_pivot_baseline.columns and pd.Timestamp(day_date_for_plotting) in req_pivot_sim.columns:
+                        fig_comp_req.add_trace(go.Scatter(x=intervals_str_fmt, y=req_pivot_baseline[pd.Timestamp(day_date_for_plotting)], mode='lines', name='Baseline Required', line=dict(color='blue', dash='dot')), row=i+1, col=1)
+                        fig_comp_req.add_trace(go.Scatter(x=intervals_str_fmt, y=req_pivot_sim[pd.Timestamp(day_date_for_plotting)], mode='lines', name='Simulated Required', line=dict(color='red')), row=i+1, col=1)
+                fig_comp_req.update_layout(height=1400, showlegend=True, title_text="Daily Required Staff: Baseline vs Simulated")
+                st.plotly_chart(fig_comp_req, use_container_width=True)
+
+                st.markdown("##### Volume Comparison")
+                fig_comp_vol = make_subplots(rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=days_of_week_ordered)
+                for i, day in enumerate(days_of_week_ordered):
+                    day_date = sorted(week_dates_dt)[i]
+                    date_col_pd = pd.Timestamp(day_date)
+                    if date_col_pd in volume_pivot_baseline.columns and date_col_pd in volume_pivot_sim.columns:
+                        fig_comp_vol.add_trace(go.Bar(x=intervals_str_fmt, y=volume_pivot_baseline[date_col_pd], name='Baseline Volume', marker_color='lightblue'), row=i+1, col=1)
+                        fig_comp_vol.add_trace(go.Bar(x=intervals_str_fmt, y=volume_pivot_sim[date_col_pd], name='Simulated Volume', marker_color='lightcoral'), row=i+1, col=1)
+                fig_comp_vol.update_layout(height=1400, showlegend=True, title_text="Daily Volume: Baseline vs Simulated")
+                st.plotly_chart(fig_comp_vol, use_container_width=True)
+
+
+            with tab_params:
+                st.markdown("##### Parameter Adjustments")
+                # Check if baseline_params has the correct structure for blending or single channel
+                if 'channel_params' in baseline_params and is_blended:
+                    # For blended scenarios, show individual channel adjustments
+                    param_data = []
+
+                    # Volume Multiplier is global for blended scenarios
+                    param_data.append({
+                        "Parameter": "Overall Volume Multiplier",
+                        "Baseline Value": 1.0,
+                        "Simulated Value": volume_multiplier,
+                        "Change": f"{volume_multiplier - 1.0:+.2f} ({(volume_multiplier - 1.0)/1.0*100:+.1f}%)"
+                    })
+                    
+                    # AHT and Shrinkage for each channel
+                    for ch_name in baseline_params['channels']:
+                        base_aht = baseline_params['channel_params'][ch_name].get('aht', 0)
+                        sim_aht = simulated_params['channel_params'][ch_name].get('aht', 0)
+                        aht_change_val = sim_aht / base_aht if base_aht != 0 else (0 if sim_aht == 0 else float('inf'))
+                        aht_percent_change = ((sim_aht - base_aht) / base_aht) * 100 if base_aht != 0 else (0 if sim_aht == 0 else float('inf'))
+                        param_data.append({
+                            "Parameter": f"{ch_name} AHT Multiplier",
+                            "Baseline Value": 1.0, # Multiplier not actual AHT value here
+                            "Simulated Value": aht_multiplier,
+                            "Change": f"{aht_multiplier - 1.0:+.2f} ({(aht_multiplier - 1.0)/1.0*100:+.1f}%)"
+                        })
+                        
+                        base_shrinkage = baseline_params['channel_params'][ch_name].get('shrinkage', 0)
+                        sim_shrinkage = simulated_params['channel_params'][ch_name].get('shrinkage', 0)
+                        param_data.append({
+                            "Parameter": f"{ch_name} Shrinkage Adjustment",
+                            "Baseline Value": 0.0, # Absolute adjustment
+                            "Simulated Value": shrink_adj,
+                            "Change": f"{sim_shrinkage - base_shrinkage:+.1f} pp"
+                        })
                 else:
-                    st.warning("No data to display.")
+                    # Original logic for single channel
+                    param_data = {
+                        "Parameter": ["Volume Multiplier", "AHT Multiplier", "Shrinkage Adjustment"],
+                        "Baseline Value": [1.0, 1.0, 0.0],
+                        "Simulated Value": [volume_multiplier, aht_multiplier, shrink_adj]
+                    }
 
-        # Process baseline and simulated data
-        baseline_data = process_forecast_output(baseline_staffing_df, week_start_dt)
-        simulated_data = process_forecast_output(sim_staffing_df, week_start_dt)
+                    # Calculate Change column
+                    param_data["Change"] = []
+                    for i in range(len(param_data["Parameter"])):
+                        baseline_val = param_data["Baseline Value"][i]
+                        simulated_val = param_data["Simulated Value"][i]
+                        change_val = simulated_val - baseline_val
+                        
+                        if param_data["Parameter"][i] == "Shrinkage Adjustment":
+                            param_data["Change"].append(f"{change_val:+.1f} pp")
+                        elif baseline_val != 0:
+                            percent_change = (change_val / baseline_val) * 100
+                            param_data["Change"].append(f"{change_val:+.2f} ({percent_change:+.1f}%)")
+                        else:
+                            param_data["Change"].append(f"{change_val:+.2f}") # Handle 0 baseline gracefully
 
-        st.markdown("---")
-        st.header("Simulation Results")
-        col1, col2, col3 = st.columns(3)
+                param_df = pd.DataFrame(param_data)
+                
+                st.dataframe(param_df.style.format({
+                    "Baseline Value": '{:,.2f}',
+                    "Simulated Value": '{:,.2f}'
+                }, na_rep="N/A"))
 
-        display_what_if_card(col1, baseline_data, "Baseline Forecast", "base")
-        display_what_if_card(col2, simulated_data, "Simulated Forecast", "sim")
+            with tab_interval_tables:
+                st.subheader("Baseline Required Staffing")
+                st.info("The original staffing requirements for each interval from the selected forecast.")
+                st.dataframe(req_pivot_baseline.style.background_gradient(cmap='viridis', axis=None))
+                download_dataframe_csv(req_pivot_baseline, f"whatif_baseline_req_{selected_scenario_name}_{selected_week_str}")
 
-        with col3:
-            st.subheader("Difference")
-            if baseline_data and simulated_data:
-                kpis_base = pd.Series(baseline_data['kpis'])
-                kpis_sim = pd.Series(simulated_data['kpis'])
-                kpi_diff = (kpis_sim - kpis_base).reindex(kpis_base.index)
-                st.dataframe(kpi_diff.to_frame(name='Change').style.format("{:,.2f}", na_rep="-"), use_container_width=True)
+                st.subheader("Simulated Required Staffing")
+                st.info("The new staffing requirements after applying your simulation controls.")
+                st.dataframe(req_pivot_sim.style.background_gradient(cmap='viridis', axis=None))
+                download_dataframe_csv(req_pivot_sim, f"whatif_simulated_req_{selected_scenario_name}_{selected_week_str}")
 
-                st.markdown("###### Requirement Difference Heatmap")
-                pivot_diff = simulated_data['pivot'] - baseline_data['pivot']
-                fig_diff = go.Figure(data=go.Heatmap(
-                    z=pivot_diff.values,
-                    x=pivot_diff.columns.strftime('%A'),
-                    y=[t.strftime('%H:%M') for t in pivot_diff.index],
-                    colorscale='RdBu', zmid=0,
-                    hovertemplate='Day: %{x}<br>Time: %{y}<br>Difference: %{z:.0f}<extra></extra>'
-                ))
-                fig_diff.update_layout(height=400, margin=dict(l=20,r=20,t=20,b=20))
-                fig_diff.update_yaxes(autorange='reversed')
-                st.plotly_chart(fig_diff, use_container_width=True, key="whatif_heatmap_diff")
-
-        # Final comparison chart
-        st.markdown("---")
-        st.subheader("Daily Required Staff Comparison")
-        if baseline_data and simulated_data:
-            fig_compare = make_subplots(rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=days_of_week_ordered)
-            for i, day_name_str in enumerate(days_of_week_ordered):
-                 day_dt = (week_start_dt + datetime.timedelta(days=i))
-                 if day_dt in baseline_data['pivot'].columns:
-                     fig_compare.add_trace(go.Scatter(x=[t.strftime('%H:%M') for t in baseline_data['pivot'].index], y=baseline_data['pivot'][day_dt], name='Baseline', line=dict(color='blue')), row=i+1, col=1)
-                     fig_compare.add_trace(go.Scatter(x=[t.strftime('%H:%M') for t in simulated_data['pivot'].index], y=simulated_data['pivot'][day_dt], name='Simulated', line=dict(color='orange', dash='dash')), row=i+1, col=1)
-            fig_compare.update_layout(height=1400, showlegend=False, title_text="Daily Required Staff (Baseline vs. Simulated)")
-            fig_compare.data[0].showlegend=True
-            fig_compare.data[1].showlegend=True
-            st.plotly_chart(fig_compare, use_container_width=True)
-
-st.markdown("""<div style="position: fixed; bottom: 0; left: 0; width: 100%; text-align: center; padding: 6px; background-color: #0e1117; z-index: 100;"><p style='color:white; font-size:18px; font-weight:bold; font-family:"serif"; margin:0;'>| Developed by Ashwin Nair |</p></div>""", unsafe_allow_html=True)
+                st.subheader("Difference (Simulated - Baseline)")
+                st.info("The change in required staff for each interval. Positive values (blue) mean more staff are needed; negative values (red) mean fewer staff are needed.")
+                st.dataframe(req_diff.style.background_gradient(cmap='RdBu', axis=None))
+                download_dataframe_csv(req_diff, f"whatif_req_diff_{selected_scenario_name}_{selected_week_str}")
