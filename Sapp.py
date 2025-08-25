@@ -3997,3 +3997,237 @@ with tab4:
                 st.info("The change in required staff for each interval. Positive values (blue) mean more staff are needed; negative values (red) mean fewer staff are needed.")
                 st.dataframe(req_diff.style.background_gradient(cmap='RdBu', axis=None))
                 download_dataframe_csv(req_diff, f"whatif_req_diff_{selected_scenario_name}_{selected_week_str}")
+# --- FOOTER ---
+# It's good practice to add a placeholder to avoid content overlapping the footer.
+# This one needs to be a bit taller to accommodate the design.
+st.markdown("<div style='height: 15rem;'></div>", unsafe_allow_html=True)
+
+# Get the current year for the copyright
+current_year = datetime.datetime.now().year
+
+# --- DEFINE THE HTML AND CSS ---
+# NOTE: All CSS curly braces are doubled {{ }} to escape them in the f-string.
+footer_html = f"""
+<style>
+@keyframes shimmer {{
+    0% {{
+        background-position: -1000px 0;
+    }}
+    100% {{
+        background-position: 1000px 0;
+    }}
+}}
+
+@keyframes slideUp {{
+    from {{
+        transform: translateY(30px);
+        opacity: 0;
+    }}
+    to {{
+        transform: translateY(0);
+        opacity: 1;
+    }}
+}}
+
+:root {{
+    --bg-color: #020c1b; /* The darkest blue, almost black */
+    --primary-text: #ccd6f6;
+    --secondary-text: #8892b0;
+    --highlight-color: #64ffda; /* The vibrant mint green */
+    --spotlight-color: rgba(100, 255, 218, 0.1); /* Spotlight color with more alpha */
+    --footer-font-family: 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+}}
+
+.footer {{
+    font-family: var(--footer-font-family);
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    background: var(--bg-color);
+    color: var(--secondary-text);
+    padding: 2rem 3rem;
+    z-index: 1000;
+    box-shadow: 0 -10px 30px -15px rgba(2, 12, 27, 0.7);
+    transition: background 0.3s ease-in-out;
+
+    /* This creates the spotlight effect based on cursor position */
+    --mouse-x: 50%;
+    --mouse-y: 50%;
+    background-image: radial-gradient(
+        circle 300px at var(--mouse-x) var(--mouse-y),
+        var(--spotlight-color),
+        transparent 80%
+    );
+}}
+
+.footer::before {{
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--highlight-color), transparent);
+    animation: shimmer 4s linear infinite;
+}}
+
+.footer-content {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    max-width: 1200px;
+    margin: 0 auto;
+    gap: 1.5rem;
+}}
+
+.footer-brand {{
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    animation: slideUp 0.8s cubic-bezier(0.645, 0.045, 0.355, 1) 0.2s forwards;
+    opacity: 0;
+}}
+
+.footer-logo svg {{
+    width: 40px;
+    height: 40px;
+    fill: var(--highlight-color);
+    transition: transform 0.3s ease;
+}}
+.footer-logo:hover svg {{
+    transform: rotate(-10deg) scale(1.1);
+}}
+
+.footer-credit {{
+    font-size: 0.9rem;
+}}
+.footer-credit a {{
+    color: var(--primary-text);
+    text-decoration: none;
+    font-weight: bold;
+    transition: color 0.3s ease;
+}}
+.footer-credit a:hover {{
+    color: var(--highlight-color);
+}}
+.footer-copyright {{
+    font-size: 0.8rem;
+}}
+
+.footer-links {{
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+}}
+
+.footer-item {{
+    opacity: 0;
+    animation: slideUp 0.8s cubic-bezier(0.645, 0.045, 0.355, 1) forwards;
+}}
+.footer-item:nth-child(1) {{ animation-delay: 0.4s; }}
+.footer-item:nth-child(2) {{ animation-delay: 0.6s; }}
+.footer-item:nth-child(3) {{ animation-delay: 0.8s; }}
+
+.footer-item a {{
+    color: var(--secondary-text);
+    text-decoration: none;
+    display: inline-block;
+    position: relative;
+    transition: color 0.3s ease, transform 0.3s ease;
+}}
+
+/* Animated Underline */
+.footer-item a::after {{
+    content: '';
+    position: absolute;
+    width: 100%;
+    height: 1px;
+    bottom: -4px;
+    left: 0;
+    background-color: var(--highlight-color);
+    transform: scaleX(0);
+    transform-origin: bottom right;
+    transition: transform 0.3s ease-out;
+}}
+
+.footer-item:hover a {{
+    color: var(--highlight-color);
+    transform: translateY(-3px);
+}}
+.footer-item:hover a::after {{
+    transform: scaleX(1);
+    transform-origin: bottom left;
+}}
+
+.footer-item svg {{
+    width: 24px;
+    height: 24px;
+    fill: var(--secondary-text);
+    margin-right: 0.5rem;
+    transition: fill 0.3s ease, transform 0.3s ease;
+}}
+
+.footer-item:hover svg {{
+    fill: var(--highlight-color);
+    transform: translateY(-3px) scale(1.15) rotate(-10deg);
+}}
+
+@media (max-width: 768px) {{
+    .footer-content {{
+        flex-direction: column;
+        justify-content: center;
+        gap: 2rem;
+    }}
+}}
+</style>
+
+<div class="footer" id="page-footer">
+    <div class="footer-content">
+        <div class="footer-brand">
+            <a href="https://www.linkedin.com/in/ashwin-nair-se/" target="_blank" rel="noopener noreferrer" class="footer-logo" title="Ashwin Nair">
+                <!-- 'AN' Initials SVG Logo -->
+                <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+                    <text x="50%" y="60%" dominant-baseline="middle" text-anchor="middle" font-family="var(--footer-font-family)" font-size="300" font-weight="bold" fill="currentColor">
+                        AN
+                    </text>
+                </svg>
+            </a>
+            <div class="footer-credit">
+                <a href="https://www.linkedin.com/in/ashwin-nair-se/" target="_blank" rel="noopener noreferrer">Ashwin Nair</a>
+                <div class="footer-copyright">© {current_year} All rights reserved.</div>
+            </div>
+        </div>
+        <div class="footer-links">
+            <div class="footer-item">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 3v18h24v-18h-24zm21.518 2l-9.518 7.713-9.518-7.713h19.036zm-19.518 14v-11.817l10 8.104 10-8.104v11.817h-20z"/></svg>
+                <a href="mailto:19.nair@gmail.com" target="_blank" rel="noopener noreferrer">19.nair@gmail.com</a>
+            </div>
+            <div class="footer-item">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 22.621l-3.521-6.795c-.32-.607-1.045-1.001-1.789-1.001-1.298 0-2.355 1.057-2.355 2.355 0 .285.053.557.147.809l-1.315-.815c-1.631-.998-3.41-2.223-5.26-3.929-1.92-1.764-3.32-3.83-4.225-5.918l-.54-1.21c.214-.082.434-.131.666-.131 1.298 0 2.355-1.057 2.355-2.355 0-.745-.395-1.47-1.002-1.789l-6.793-3.521-2.123 4.086c.038.165.08.336.141.516.484 1.459 1.258 2.846 2.26 4.341 1.096 1.639 2.454 3.193 4.14 4.793s3.472 2.915 5.166 4.013c1.492.973 2.873 1.742 4.33 2.223.181.061.352.103.518.14l4.085-2.122z"/></svg>
+                <a href="tel:+918652508240" target="_blank" rel="noopener noreferrer">+91 8652508240</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const footer = document.getElementById('page-footer');
+    if (footer) {{
+        document.addEventListener('mousemove', (e) => {{
+            const rect = footer.getBoundingClientRect();
+            // Get mouse position relative to the footer element
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            // Set the CSS variables
+            footer.style.setProperty('--mouse-x', `${{x}}px`);
+            footer.style.setProperty('--mouse-y', `${{y}}px`);
+        }});
+    }}
+</script>
+"""
+
+# --- Render the Footer ---
+st.markdown(footer_html, unsafe_allow_html=True)
