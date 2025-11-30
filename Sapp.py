@@ -78,11 +78,96 @@ if 'daily_op_hours' not in st.session_state:
         "Saturday": {"Start Time": datetime.time(9, 0), "End Time": datetime.time(17, 0)},
     }
 
+# --- NEW: Pass 2 Break Optimization State ---
+if 'break_sequences_df' not in st.session_state:
+    # New structure: Each row defines a complete break sequence for a shift length range
+    st.session_state.break_sequences_df = pd.DataFrame([
+        {
+            'Min Shift Length (hrs)': 6.0,
+            'Max Shift Length (hrs)': 9.0,
+            'Break Sequence': 'Tea Break 1: 15 mins | Lunch Break: 30 mins | Tea Break 2: 15 mins',
+            'Break Order': 'Tea Break 1 (15m) → Lunch Break (30m) → Tea Break 2 (15m)'
+        },
+        {
+            'Min Shift Length (hrs)': 9.0,
+            'Max Shift Length (hrs)': 12.0,
+            'Break Sequence': 'Tea Break 1: 15 mins | Lunch Break: 45 mins | Tea Break 2: 15 mins | Dinner Break: 30 mins',
+            'Break Order': 'Tea Break 1 (15m) → Lunch Break (45m) → Tea Break 2 (15m) → Dinner Break (30m)'
+        }
+    ])
+if 'max_concurrency_pct' not in st.session_state:
+    st.session_state.max_concurrency_pct = 30.0
+if 'pass2_break_optimization' not in st.session_state:
+    st.session_state.pass2_break_optimization = False
+if 'break_optimization_results' not in st.session_state:
+    st.session_state.break_optimization_results = {}
+
 
 DAYS_OF_WEEK_OPTIONS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
 # ------------------------------------------------------------------------------
 #                           HELPER / UTILITY FUNCTIONS
+def robust_day_name_match(target_day_name, distribution_day_entries):
+    """
+    Robustly matches day names between different formats.
+    
+    Args:
+        target_day_name: Full day name from date object (e.g., 'Monday')
+        distribution_day_entries: List or Series of day entries from distribution data
+        
+    Returns:
+        tuple: (matched_row, match_type) where match_type indicates how it was matched
+    """
+    import re
+    
+    # Create day abbreviation mapping
+    day_abbrevs = {
+        'Sunday': ['Sun', 'Sun.'],
+        'Monday': ['Mon', 'Mon.'],
+        'Tuesday': ['Tue', 'Tues', 'Tues.', 'Tue.'],
+        'Wednesday': ['Wed', 'Wed.'],
+        'Thursday': ['Thu', 'Thurs', 'Thurs.', 'Thu.', 'Thu'],
+        'Friday': ['Fri', 'Fri.'],
+        'Saturday': ['Sat', 'Sat.']
+    }
+    
+    # Try exact match first
+    for idx, dist_entry in distribution_day_entries.items():
+        dist_day_str = str(dist_entry).strip()
+        if dist_day_str == target_day_name:
+            return distribution_day_entries.iloc[[idx]], 'exact'
+    
+    # Try case-insensitive exact match
+    for idx, dist_entry in distribution_day_entries.items():
+        dist_day_str = str(dist_entry).strip().lower()
+        if dist_day_str == target_day_name.lower():
+            return distribution_day_entries.iloc[[idx]], 'exact_case_insensitive'
+    
+    # Try matching day abbreviations
+    target_abbrevs = day_abbrevs.get(target_day_name, [target_day_name[:3]])
+    for abbrev in target_abbrevs:
+        for idx, dist_entry in distribution_day_entries.items():
+            dist_day_str = str(dist_entry).strip()
+            # Check if entry starts with abbreviation
+            if dist_day_str.startswith(abbrev + ' ') or dist_day_str.startswith(abbrev + '.'):
+                return distribution_day_entries.iloc[[idx]], f'abbrev_{abbrev}'
+            # Check if abbreviation is contained in the entry
+            if abbrev in dist_day_str:
+                return distribution_day_entries.iloc[[idx]], f'contains_{abbrev}'
+    
+    # Try pattern matching for various formats
+    for idx, dist_entry in distribution_day_entries.items():
+        dist_day_str = str(dist_entry).strip()
+        # Extract day name from formatted entries like "Mon 11/16" or "Monday Nov 16"
+        day_pattern = r'^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sun|Mon|Tue|Wed|Thu|Fri|Sat)'
+        match = re.search(day_pattern, dist_day_str, re.IGNORECASE)
+        if match:
+            matched_day = match.group(1).lower()
+            if matched_day in [day.lower() for day in day_abbrevs[target_day_name]] or matched_day == target_day_name.lower():
+                return distribution_day_entries.iloc[[idx]], 'pattern'
+    
+    # No match found
+    return None, 'no_match'
 # ------------------------------------------------------------------------------
 
 def safe_update_dataframe(df_key, new_columns, index_ref):
@@ -134,22 +219,32 @@ def validate_and_convert_to_float(value, input_name):
     except (ValueError, TypeError):
         raise ValueError(f"Invalid input '{value}' for {input_name}.")
 
-def calculate_adherence_metrics(req_matrix, sched_matrix, cap_percent, day_order):
+def calculate_adherence_metrics(req_matrix, sched_matrix, cap_percent, day_order, break_optimization_data=None):
     """
     Calculates detailed adherence metrics using floating-point logic to match Excel.
+    Uses net staffing (after breaks) when break optimization data is available.
     """
     num_days, num_intervals = req_matrix.shape
     # Ensure intervals_str is a list of formatted strings
     intervals_str = [t.strftime('%H:%M') for t in st.session_state.intervals]
 
-
     detail_rows = []
+    
+    # Determine which staffing matrix to use
+    if break_optimization_data and break_optimization_data.get('net_staffing_matrix') is not None:
+        # Use net staffing (after breaks) when available
+        actual_staffing_matrix = break_optimization_data['net_staffing_matrix']
+        staffing_type = "Net (After Breaks)"
+    else:
+        # Use gross staffing when no break optimization or net staffing unavailable
+        actual_staffing_matrix = sched_matrix
+        staffing_type = "Gross"
 
     # 1. Calculate interval-level metrics first
     for d_idx, day_name in enumerate(day_order):
         for p_idx, interval_time in enumerate(intervals_str):
             req = req_matrix[d_idx, p_idx]
-            sched = sched_matrix[d_idx, p_idx]
+            sched = actual_staffing_matrix[d_idx, p_idx]
 
             raw_adherence = 0.0
             if req > 0:
@@ -169,6 +264,7 @@ def calculate_adherence_metrics(req_matrix, sched_matrix, cap_percent, day_order
                 "Interval": interval_time,
                 "Required": int(req),
                 "Scheduled": int(sched),
+                "Staffing Type": staffing_type,
                 "Raw Adherence (%)": raw_adherence,
                 "Capped Adherence (%)": capped_adherence,
                 "Capped Scheduled Contribution": capped_sched_contribution
@@ -207,7 +303,9 @@ def calculate_adherence_metrics(req_matrix, sched_matrix, cap_percent, day_order
     return {
         "weekly_adherence": weekly_adherence_value,
         "daily_adherence": daily_adherence_values,
-        "adherence_df": adherence_df
+        "adherence_df": adherence_df,
+        "staffing_type": staffing_type,
+        "break_optimization_used": break_optimization_data is not None and break_optimization_data.get('net_staffing_matrix') is not None
     }
 
 def calculate_fte_metrics_from_matrix(matrix, working_hours, working_days):
@@ -386,6 +484,427 @@ def download_dataframe_csv_no_index(df, filename_prefix):
         key=f"download_csv_{filename_prefix}_{id(df)}" # Unique key per df instance
     )
 
+# ------------------------------------------------------------------------------
+#                           PASS 2: BREAK OPTIMIZATION FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def parse_shift_info(shift_text):
+    """
+    Parse shift text to extract start time and shift length.
+    Expected format: "08:00-17:00 (9.0hr)" or similar variants.
+    Returns: tuple of (start_time, shift_length_hours) or (None, None) if parsing fails
+    """
+    import re
+    
+    if not shift_text or shift_text == 'OFF':
+        return None, None
+
+    # Pattern to match time range and hours
+    patterns = [
+        r'(\d{1,2}:\d{2})-(\d{1,2}:\d{2})\s*\((\d+(?:\.\d+)?)hr\)',  # 08:00-17:00 (9.0hr)
+        r'(\d{1,2}:\d{2})-(\d{1,2}:\d{2})\s*\((\d+(?:\.\d+)?)\)hr',  # 08:00-17:00 (9)hr
+        r'(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*\((\d+(?:\.\d+)?)hr\)',  # 08:00 - 17:00 (9.0hr)
+        r'(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*\((\d+(?:\.\d+)?)\)hr',  # 08:00 - 17:00 (9)hr
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, shift_text)
+        if match:
+            try:
+                start_time_str, end_time_str, hours_str = match.groups()
+                
+                # Parse start time
+                start_hour, start_min = map(int, start_time_str.split(':'))
+                start_time = datetime.time(start_hour, start_min)
+                
+                # Parse shift length
+                shift_length_hours = float(hours_str)
+                
+                return start_time, shift_length_hours
+            except (ValueError, TypeError):
+                continue
+
+    # If no pattern matches, try to extract just time range
+    time_pattern = r'(\d{1,2}:\d{2})-(\d{1,2}:\d{2})'
+    time_match = re.search(time_pattern, shift_text)
+    if time_match:
+        try:
+            start_time_str, end_time_str = time_match.groups()
+            start_hour, start_min = map(int, start_time_str.split(':'))
+            start_time = datetime.time(start_hour, start_min)
+            
+            # For now, assume 8 hours if length not specified
+            # This could be enhanced by calculating from end time
+            return start_time, 8.0
+        except (ValueError, TypeError):
+            pass
+
+    return None, None
+
+def parse_break_sequence(sequence_str):
+    """
+    Parse a break sequence string into individual breaks.
+    Expected format: "Tea Break 1: 15 mins | Lunch Break: 30 mins | Tea Break 2: 15 mins"
+    
+    Returns: list of dictionaries with break information
+    """
+    if not sequence_str:
+        return []
+    
+    breaks = []
+    
+    # Split by | to get individual breaks
+    break_parts = [part.strip() for part in sequence_str.split('|')]
+    
+    for part in break_parts:
+        if ':' in part:
+            # Split by colon to get name and duration
+            name_part, duration_part = part.split(':', 1)
+            break_name = name_part.strip()
+            duration_str = duration_part.strip()
+            
+            # Parse duration (extract number)
+            import re
+            duration_match = re.search(r'(\d+)', duration_str)
+            if duration_match:
+                duration_mins = int(duration_match.group(1))
+                breaks.append({
+                    'name': break_name,
+                    'duration_mins': duration_mins,
+                    'order': len(breaks) + 1
+                })
+    
+    return breaks
+
+def optimize_breaks_ortools(roster_df, req_matrix, break_sequences_df, max_concurrency_pct,
+                           min_break_interval=30, flexible_timing=True, window_flexibility=15,
+                           ensure_minimum_coverage=True):
+    """
+    Optimize break sequences for scheduled staff using OR-Tools constraint programming.
+    Supports sequential break scheduling with named breaks in specific order.
+
+    Args:
+        roster_df: DataFrame with employee shifts
+        req_matrix: numpy array of required staffing per interval
+        break_sequences_df: DataFrame with break sequences per shift length
+        max_concurrency_pct: Maximum percentage of staff on break at once
+        min_break_interval: Minimum time between consecutive breaks in minutes
+        flexible_timing: Allow breaks to be moved within reasonable bounds
+        window_flexibility: How much flexibility to allow when scheduling breaks (%)
+        ensure_minimum_coverage: Prioritize ensuring all employees get breaks
+
+    Returns:
+        dict with optimization results
+    """
+    if roster_df.empty:
+        return {'status': 'INFEASIBLE', 'reason': 'No roster data provided'}
+
+    model = cp_model.CpModel()
+    num_intervals = 48  # 30-minute intervals per day
+    num_days = 7
+
+    # Parse shift info for each employee and day
+    eligible_shifts = []  # List of (employee_idx, day_idx, start_time, shift_length)
+
+    for emp_idx, row in roster_df.iterrows():
+        for day_idx, day_name in enumerate(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']):
+            if day_name in row:
+                shift_text = str(row[day_name])
+                start_time, shift_length = parse_shift_info(shift_text)
+                
+                if start_time is not None and shift_length is not None:
+                    eligible_shifts.append((emp_idx, day_idx, start_time, shift_length))
+
+    if not eligible_shifts:
+        return {'status': 'INFEASIBLE', 'reason': 'No eligible shifts found for break optimization'}
+
+    # Parse break sequences by shift length ranges
+    break_sequences_by_shift = {}
+    for _, seq_row in break_sequences_df.iterrows():
+        shift_range = (seq_row['Min Shift Length (hrs)'], seq_row['Max Shift Length (hrs)'])
+        sequence_str = seq_row['Break Sequence']
+        
+        if shift_range not in break_sequences_by_shift:
+            break_sequences_by_shift[shift_range] = []
+        
+        breaks = parse_break_sequence(sequence_str)
+        if breaks:  # Only add if we successfully parsed breaks
+            break_sequences_by_shift[shift_range].extend(breaks)
+
+    # Create break variables for each eligible shift and break in sequence
+    break_start_vars = {}  # (shift_idx, break_order, break_name) -> start time variable
+    break_taken_vars = {}  # (shift_idx, break_order, break_name) -> boolean variable
+
+    for i, (emp_idx, day_idx, start_time, shift_length) in enumerate(eligible_shifts):
+        # Find applicable break sequence for this shift length
+        applicable_sequence = None
+        for shift_range, breaks in break_sequences_by_shift.items():
+            min_len, max_len = shift_range
+            if min_len <= shift_length <= max_len:
+                applicable_sequence = breaks
+                break
+        
+        if not applicable_sequence:
+            continue  # No break sequence defined for this shift length
+        
+        # Create variables for each break in the sequence
+        shift_start_interval = start_time.hour * 2 + start_time.minute // 30
+        shift_end_interval = int((shift_start_interval + shift_length * 2) % num_intervals)
+        shift_duration_intervals = int(shift_length * 2)
+        
+        for break_info in applicable_sequence:
+            break_name = break_info['name']
+            break_order = break_info['order']
+            break_duration_mins = break_info['duration_mins']
+            break_duration_intervals = int(break_duration_mins / 30)
+            
+            var_key = (i, break_order, break_name)
+            break_start_vars[var_key] = model.NewIntVar(0, num_intervals-1, f'break_start_{i}_{break_order}_{break_name}')
+            break_taken_vars[var_key] = model.NewBoolVar(f'break_taken_{i}_{break_order}_{break_name}')
+            
+            # Calculate optimal break window based on position in sequence
+            # For sequential breaks, allocate time proportionally
+            total_break_time = sum(b['duration_mins'] for b in applicable_sequence)
+            if total_break_time > 0:
+                # Calculate position-based percentages
+                preceding_breaks_time = sum(b['duration_mins'] for j, b in enumerate(applicable_sequence) if j < break_order - 1)
+                break_position_ratio = (preceding_breaks_time + break_duration_mins/2) / (shift_length * 60)
+                
+                # Apply flexibility if enabled
+                flex_factor = window_flexibility / 100.0 if flexible_timing else 0
+                earliest_pct = max(0, (break_position_ratio * 100) - (flex_factor * 50))
+                latest_pct = min(100, (break_position_ratio * 100) + (flex_factor * 50))
+            else:
+                earliest_pct, latest_pct = 25, 75  # Default window
+            
+            # Calculate absolute time windows
+            earliest_start_interval = int(shift_start_interval + (shift_duration_intervals * earliest_pct / 100)) % num_intervals
+            latest_start_interval = int(shift_start_interval + (shift_duration_intervals * latest_pct / 100)) % num_intervals
+            
+            # Constraint: Break must be within valid window
+            if earliest_start_interval <= latest_start_interval:
+                model.Add(break_start_vars[var_key] >= earliest_start_interval).OnlyEnforceIf(break_taken_vars[var_key])
+                model.Add(break_start_vars[var_key] <= latest_start_interval).OnlyEnforceIf(break_taken_vars[var_key])
+            else:  # Window wraps around midnight
+                # Create boolean variables for the OR conditions
+                break_after_earliest = model.NewBoolVar(f'break_after_earliest_{i}_{break_order}_{break_name}')
+                model.Add(break_start_vars[var_key] >= earliest_start_interval).OnlyEnforceIf(break_after_earliest)
+                model.Add(break_start_vars[var_key] < earliest_start_interval).OnlyEnforceIf(break_after_earliest.Not())
+                
+                break_before_latest = model.NewBoolVar(f'break_before_latest_{i}_{break_order}_{break_name}')
+                model.Add(break_start_vars[var_key] <= latest_start_interval).OnlyEnforceIf(break_before_latest)
+                model.Add(break_start_vars[var_key] > latest_start_interval).OnlyEnforceIf(break_before_latest.Not())
+                
+                # Use the boolean variables in the OR constraint
+                model.AddBoolOr([break_after_earliest, break_before_latest]).OnlyEnforceIf(break_taken_vars[var_key])
+            
+            # Constraint: Break cannot extend beyond shift end
+            if shift_end_interval > shift_start_interval:
+                model.Add(break_start_vars[var_key] + break_duration_intervals <= shift_end_interval).OnlyEnforceIf(break_taken_vars[var_key])
+            else:  # Shift wraps around midnight
+                # Create boolean variables for the OR conditions
+                break_ends_before_overnight = model.NewBoolVar(f'break_ends_before_overnight_{i}_{break_order}_{break_name}')
+                model.Add(break_start_vars[var_key] + break_duration_intervals <= shift_end_interval + num_intervals).OnlyEnforceIf(break_ends_before_overnight)
+                model.Add(break_start_vars[var_key] + break_duration_intervals > shift_end_interval + num_intervals).OnlyEnforceIf(break_ends_before_overnight.Not())
+                
+                break_starts_after_shift_end = model.NewBoolVar(f'break_starts_after_shift_end_{i}_{break_order}_{break_name}')
+                model.Add(break_start_vars[var_key] >= shift_end_interval).OnlyEnforceIf(break_starts_after_shift_end)
+                model.Add(break_start_vars[var_key] < shift_end_interval).OnlyEnforceIf(break_starts_after_shift_end.Not())
+                
+                # Use the boolean variables in the OR constraint
+                model.AddBoolOr([break_ends_before_overnight, break_starts_after_shift_end]).OnlyEnforceIf(break_taken_vars[var_key])
+            
+            # Add minimum time constraint between consecutive breaks
+            if min_break_interval > 0 and break_order > 1:
+                min_gap_intervals = int(min_break_interval / 30)
+                previous_break = None
+                for prev_break in applicable_sequence:
+                    if prev_break['order'] == break_order - 1:
+                        previous_break = prev_break
+                        break
+                
+                if previous_break:
+                    prev_var_key = (i, break_order - 1, previous_break['name'])
+                    if prev_var_key in break_start_vars:
+                        # Ensure minimum gap between consecutive breaks
+                        model.Add(break_start_vars[var_key] >= break_start_vars[prev_var_key] + min_gap_intervals).OnlyEnforceIf(break_taken_vars[prev_var_key]).OnlyEnforceIf(break_taken_vars[var_key])
+
+    # Concurrency constraint: No more than max_concurrency_pct of staff on break at once
+    total_scheduled_staff = np.sum(req_matrix)
+    max_on_break = int(total_scheduled_staff * max_concurrency_pct / 100)
+
+    for interval_idx in range(num_intervals):
+        staff_on_break = []
+        
+        for i, (emp_idx, day_idx, start_time, shift_length) in enumerate(eligible_shifts):
+            for var_key, break_var in break_taken_vars.items():
+                shift_idx, break_order, break_name = var_key
+                if shift_idx == i:
+                    # Find the break duration for this break
+                    break_duration = 0
+                    for shift_range, breaks in break_sequences_by_shift.items():
+                        min_len, max_len = shift_range
+                        if min_len <= shift_length <= max_len:
+                            for break_info in breaks:
+                                if break_info['order'] == break_order and break_info['name'] == break_name:
+                                    break_duration = int(break_info['duration_mins'] / 30)
+                                    break
+                            break
+                    
+                    if break_duration > 0:
+                        break_start = break_start_vars[var_key]
+                        break_end = break_start + break_duration
+                        
+                        # Create boolean variable to indicate if this break covers the interval
+                        break_covers_interval = model.NewBoolVar(f'break_covers_{i}_{break_order}_{break_name}_{interval_idx}')
+                        
+                        if break_end <= num_intervals:
+                            model.Add(break_start <= interval_idx).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval)
+                            model.Add(break_end > interval_idx).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval)
+                            model.Add(break_start > interval_idx).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval.Not())
+                            model.Add(break_end <= interval_idx).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval.Not())
+                        else:  # Break wraps around midnight
+                            # Handle overnight breaks - break covers intervals that are either:
+                            # 1. After break_start, OR
+                            # 2. Before break_end (which is wrapped around)
+                            break_covers_before_wrap = model.NewBoolVar(f'break_covers_before_wrap_{i}_{break_order}_{break_name}_{interval_idx}')
+                            model.Add(break_start <= interval_idx).OnlyEnforceIf(break_covers_before_wrap)
+                            model.Add(break_start > interval_idx).OnlyEnforceIf(break_covers_before_wrap.Not())
+                            
+                            break_covers_after_wrap = model.NewBoolVar(f'break_covers_after_wrap_{i}_{break_order}_{break_name}_{interval_idx}')
+                            # break_end is wrapped around, so it covers intervals before break_end
+                            model.Add(interval_idx < break_end).OnlyEnforceIf(break_covers_after_wrap)
+                            model.Add(interval_idx >= break_end).OnlyEnforceIf(break_covers_after_wrap.Not())
+                            
+                            # Break covers interval if either condition is true
+                            model.AddBoolOr([break_covers_before_wrap, break_covers_after_wrap]).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval)
+                            model.AddBoolOr([break_covers_before_wrap.Not(), break_covers_after_wrap.Not()]).OnlyEnforceIf(break_var).OnlyEnforceIf(break_covers_interval.Not())
+                        
+                        staff_on_break.append(break_covers_interval)
+        
+        # Add constraint on total staff on break
+        if staff_on_break:
+            model.Add(sum(staff_on_break) <= max_on_break)
+
+    # Calculate current staffing (before breaks) for each interval
+    gross_staffing = np.zeros((num_days, num_intervals))
+
+    for emp_idx, row in roster_df.iterrows():
+        for day_idx, day_name in enumerate(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']):
+            if day_name in row:
+                shift_text = str(row[day_name])
+                start_time, shift_length = parse_shift_info(shift_text)
+                
+                if start_time is not None and shift_length is not None:
+                    # Mark employee as working during shift
+                    start_interval = start_time.hour * 2 + start_time.minute // 30
+                    end_interval = int((start_interval + shift_length * 2) % num_intervals)
+                    
+                    current_interval = start_interval
+                    while current_interval != end_interval:
+                        if 0 <= day_idx < num_days and 0 <= current_interval < num_intervals:
+                            gross_staffing[day_idx, current_interval] += 1
+                        current_interval = (current_interval + 1) % num_intervals
+
+    # Calculate net staffing (after breaks) and deviation from requirements
+    understaff_vars = []
+    overstaff_vars = []
+
+    for day_idx in range(num_days):
+        for interval_idx in range(num_intervals):
+            # Calculate staff on break at this interval
+            staff_on_break_this_interval = 0
+            for i, (emp_idx, day_idx_shift, start_time, shift_length) in enumerate(eligible_shifts):
+                if day_idx_shift == day_idx:
+                    # Sum all breaks that cover this interval
+                    for var_key, break_var in break_taken_vars.items():
+                        shift_idx, break_order, break_name = var_key
+                        if shift_idx == i:
+                            # For now, assume if break is taken, it contributes to this interval
+                            # A more precise implementation would check actual time overlap
+                            staff_on_break_this_interval += break_var
+            
+            # Net staffing = Gross staffing - Staff on break
+            net_staffing = gross_staffing[day_idx, interval_idx] - staff_on_break_this_interval
+            required_staff = req_matrix[day_idx, interval_idx] if day_idx < req_matrix.shape[0] and interval_idx < req_matrix.shape[1] else 0
+            
+            under_var = model.NewIntVar(0, 1000, f'under_{day_idx}_{interval_idx}')
+            over_var = model.NewIntVar(0, 1000, f'over_{day_idx}_{interval_idx}')
+            
+            model.Add(net_staffing - required_staff == over_var - under_var)
+            understaff_vars.append(under_var)
+            overstaff_vars.append(over_var)
+
+    # Minimize total deviation
+    total_deviation = sum(understaff_vars) + sum(overstaff_vars)
+    model.Minimize(total_deviation)
+
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 60.0
+    solver.parameters.num_search_workers = os.cpu_count() or 4
+    status = solver.Solve(model)
+
+    results = {'status': cp_model.StatusName(status)}
+
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        # Extract break assignments
+        break_assignments = []
+        for i, (emp_idx, day_idx, start_time, shift_length) in enumerate(eligible_shifts):
+            for var_key, break_var in break_taken_vars.items():
+                if solver.Value(break_var) == 1:
+                    shift_idx, break_order, break_name = var_key
+                    if shift_idx == i:
+                        break_start_interval = solver.Value(break_start_vars[var_key])
+                        
+                        # Find the break duration
+                        break_duration_mins = 0
+                        for shift_range, breaks in break_sequences_by_shift.items():
+                            min_len, max_len = shift_range
+                            if min_len <= shift_length <= max_len:
+                                for break_info in breaks:
+                                    if break_info['order'] == break_order and break_info['name'] == break_name:
+                                        break_duration_mins = break_info['duration_mins']
+                                        break
+                                break
+                        
+                        if break_duration_mins > 0:
+                            break_start_time = datetime.time(break_start_interval // 2, (break_start_interval % 2) * 30)
+                            break_end_interval = (break_start_interval + int(break_duration_mins / 30)) % num_intervals
+                            break_end_time = datetime.time(break_end_interval // 2, (break_end_interval % 2) * 30)
+                            
+                            break_assignments.append({
+                                'employee': roster_df.iloc[emp_idx]['Employee'],
+                                'day': ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'][day_idx],
+                                'shift_start': start_time,
+                                'shift_length': shift_length,
+                                'break_name': break_name,
+                                'break_order': break_order,
+                                'break_start': break_start_time,
+                                'break_end': break_end_time,
+                                'break_duration': break_duration_mins
+                            })
+        
+        results['break_assignments'] = break_assignments
+        
+        # Calculate net staffing matrix
+        net_staffing_matrix = gross_staffing.copy()
+        for assignment in break_assignments:
+            # Subtract break coverage from net staffing
+            day_idx = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].index(assignment['day'])
+            break_start_interval = assignment['break_start'].hour * 2 + assignment['break_start'].minute // 30
+            break_duration_intervals = int(assignment['break_duration'] / 30)
+            
+            for j in range(break_duration_intervals):
+                interval_idx = (break_start_interval + j) % num_intervals
+                if 0 <= day_idx < net_staffing_matrix.shape[0] and 0 <= interval_idx < net_staffing_matrix.shape[1]:
+                    net_staffing_matrix[day_idx, interval_idx] -= 1
+        
+        results['net_staffing_matrix'] = net_staffing_matrix
+        results['gross_staffing_matrix'] = gross_staffing
+
+    return results
+
 
 # ------------------------------------------------------------------------------
 #                           TAB 1: STAFFING CALCULATOR
@@ -491,19 +1010,44 @@ def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_d
     intervals_list = st.session_state.intervals
     channel = params['channel_type']
     interval_seconds = (pd.to_timedelta(st.session_state.interval_freq).total_seconds())
+    
+    # Check if using interval-level AHT
+    use_interval_aht = params.get('use_interval_aht', False)
+    aht_df = params.get('aht_df', None)
 
     for date_str in input_dates_str:
         current_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
         week_start = get_week_start(current_date, week_start_day_name)
 
-        for interval_time, volume in zip(intervals_list, volume_df[date_str]):
+        for i, interval_time in enumerate(intervals_list):
+            # Get volume value - handle both column and row access
+            try:
+                if hasattr(volume_df, 'loc'):
+                    volume = volume_df.loc[interval_time.strftime('%H:%M:%S'), date_str]
+                else:
+                    volume = volume_df.iloc[i, input_dates_str.index(date_str)]
+            except (KeyError, IndexError):
+                volume = 0
             volume_val = validate_and_convert_to_float(volume, "Volume")
+            
+            # Get AHT value - either from DataFrame or single value
+            if use_interval_aht and aht_df is not None:
+                try:
+                    if hasattr(aht_df, 'loc'):
+                        aht_val = validate_and_convert_to_float(aht_df.loc[interval_time.strftime('%H:%M:%S'), date_str], "AHT")
+                    else:
+                        aht_val = validate_and_convert_to_float(aht_df.iloc[i, input_dates_str.index(date_str)], "AHT")
+                except (KeyError, IndexError):
+                    aht_val = 0
+            else:
+                aht_val = params['aht']
+            
             common_data = {
                 "Date": pd.to_datetime(date_str), "Day": day_name_map[date_str],
                 "Interval": interval_time, "Week_Start_Day": week_start,
-                "Volume": volume_val, "AHT": params['aht']
+                "Volume": volume_val, "AHT": aht_val
             }
-            if volume_val == 0:
+            if volume_val == 0 or aht_val == 0:
                  # Ensure all columns exist even for zero volume intervals
                  staffing_results.append({**common_data, "raw_positions": 0, "final_positions": 0, "service_level": 1.0, "occupancy": 0.0, "waiting_probability": 0.0, "AWT_for_Queued_s": 0.0, "ASA_s": 0.0})
                  continue
@@ -511,9 +1055,9 @@ def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_d
             if channel in ["Voice (Erlang-C)", "Chat (Erlang with Concurrency)"]:
                 # The MultiErlangC method finds the required positions AND returns the performance KPIs for that number.
                 if channel == "Voice (Erlang-C)":
-                    kpi_results = calculate_erlang_c_positions(params['awt'], params['shrinkage'], params['max_occupancy'], params['aht'], params['target'], volume_val)
+                    kpi_results = calculate_erlang_c_positions(params['awt'], params['shrinkage'], params['max_occupancy'], aht_val, params['target'], volume_val)
                 else:  # Chat
-                    kpi_results = calculate_erlang_c_with_concurrency_positions(params['awt'], params['shrinkage'], params['max_occupancy'], params['aht'], params['target'], volume_val, params['concurrency'])
+                    kpi_results = calculate_erlang_c_with_concurrency_positions(params['awt'], params['shrinkage'], params['max_occupancy'], aht_val, params['target'], volume_val, params['concurrency'])
 
                 # Extract all KPIs from the single result dictionary
                 kpis = kpi_results[0]
@@ -535,7 +1079,7 @@ def run_staffing_calculation(params, input_dates_str, day_name_map, week_start_d
                 staffing_results.append({**result_row, **common_data})
 
             elif channel == "Email / Back Office (Transactional)":
-                raw_pos = calculate_transactional_positions(volume_val, params['aht'], params['shrinkage'], interval_seconds)
+                raw_pos = calculate_transactional_positions(volume_val, aht_val, params['shrinkage'], interval_seconds)
                 transactional_result = {
                     "raw_positions": raw_pos, "final_positions": raw_pos, "service_level": 1.0,
                     "occupancy": 0.0, "waiting_probability": 0.0, "AWT_for_Queued_s": 0.0, "ASA_s": 0.0
@@ -875,6 +1419,18 @@ def solve_schedule_ortools(required_staff, virtual_shifts, shift_groups, num_emp
             roster.append(emp_row)
         results['roster_df'] = pd.DataFrame(roster)
         results['scheduled_staff'] = [[solver.Value(p) for p in day] for day in scheduled_staff]
+        
+        # Add break optimization if enabled
+        if st.session_state.get('pass2_break_optimization', False):
+            with st.spinner(f"Running Pass 2 break sequence optimization..."):
+                break_results = optimize_breaks_ortools(
+                    results['roster_df'],
+                    np.array(required_staff),
+                    st.session_state.break_sequences_df,
+                    st.session_state.max_concurrency_pct
+                )
+                results['break_optimization'] = break_results
+    
     return results
 
 @st.cache_data(ttl=3600)
@@ -1141,6 +1697,18 @@ def solve_schedule_with_shift_optimization(required_staff, week_day_names, optim
         results['roster_df'] = pd.DataFrame(roster)
         results['scheduled_staff'] = [[solver.Value(p) for p in day] for day in scheduled_staff]
         results['virtual_shifts_generated'] = virtual_shifts_generated
+        
+        # Add break optimization if enabled
+        if st.session_state.get('pass2_break_optimization', False):
+            with st.spinner(f"Running Pass 2 break sequence optimization..."):
+                break_results = optimize_breaks_ortools(
+                    results['roster_df'],
+                    np.array(required_staff),
+                    st.session_state.break_sequences_df,
+                    st.session_state.max_concurrency_pct
+                )
+                results['break_optimization'] = break_results
+    
     return results
 
 def calculate_schedule_cost(roster_df, virtual_shifts, cost_config, week_start_dt, day_order):
@@ -1377,6 +1945,50 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
     with tab_roster:
         st.dataframe(roster_df.set_index('Employee'))
         download_dataframe_csv(roster_df.set_index('Employee'), f"{key_prefix}_roster")
+        
+        # NEW: Show detailed break schedules if break optimization was performed
+        if solution_data.get('break_optimization') and solution_data['break_optimization'].get('break_assignments'):
+            st.markdown("---")
+            st.markdown("##### 📋 Detailed Break Schedules by Employee")
+            st.info("Individual break schedules showing exact break times and durations for each employee.")
+            
+            break_assignments = solution_data['break_optimization']['break_assignments']
+            if break_assignments:
+                # Group break assignments by employee and day for better display
+                employee_day_breaks = {}
+                for assignment in break_assignments:
+                    emp_name = assignment['employee']
+                    day = assignment['day']
+                    key = f"{emp_name} - {day}"
+                    
+                    if key not in employee_day_breaks:
+                        employee_day_breaks[key] = []
+                    employee_day_breaks[key].append({
+                        'Break Name': assignment['break_name'],
+                        'Break Order': assignment['break_order'],
+                        'Start Time': assignment['break_start'].strftime('%H:%M'),
+                        'End Time': assignment['break_end'].strftime('%H:%M'),
+                        'Duration (mins)': assignment['break_duration'],
+                        'Shift Start': assignment['shift_start'].strftime('%H:%M'),
+                        'Shift Length': f"{assignment['shift_length']} hrs"
+                    })
+                
+                # Create detailed break schedule display
+                for emp_day_key in sorted(employee_day_breaks.keys()):
+                    with st.expander(f"📅 {emp_day_key}", expanded=False):
+                        breaks_df = pd.DataFrame(employee_day_breaks[emp_day_key])
+                        # Sort by break order for logical display
+                        breaks_df = breaks_df.sort_values('Break Order')
+                        st.dataframe(breaks_df, use_container_width=True)
+                
+                # Download break assignments
+                download_dataframe_csv(pd.DataFrame(break_assignments), f"{key_prefix}_break_assignments")
+            else:
+                st.info("No individual break assignments found.")
+        else:
+            st.markdown("---")
+            st.markdown("##### 📋 Break Schedule Information")
+            st.info("Break optimization is not enabled or no breaks were scheduled for this schedule.")
 
     with tab_summary:
         st.markdown("##### Staffing Grid (Employees per Shift per Day)")
@@ -1528,13 +2140,16 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
         if solution_data.get('config') and solution_data['config'].get('target_percent') is not None:
             target_adherence_percent = solution_data['config']['target_percent']
 
-        adherence_metrics = calculate_adherence_metrics(inflated_req_matrix, sched_matrix, adherence_cap_percent, day_order)
+        # Pass break optimization data to adherence calculation
+        break_optimization_data = solution_data.get('break_optimization')
+        adherence_metrics = calculate_adherence_metrics(inflated_req_matrix, sched_matrix, adherence_cap_percent, day_order, break_optimization_data)
         weekly_adherence = adherence_metrics['weekly_adherence']
         daily_adherence = adherence_metrics['daily_adherence']
         adherence_df = adherence_metrics['adherence_df']
+        staffing_type = adherence_metrics.get('staffing_type', 'Gross')
 
         st.metric(
-            label=f"**Weekly Weighted & Capped Line Adherence (vs. Inflated Req, Target: {target_adherence_percent}%)**",
+            label=f"**Weekly Weighted & Capped Line Adherence ({staffing_type} Staffing vs. Inflated Req, Target: {target_adherence_percent}%)**",
             value=f"{weekly_adherence:.2f}%",
             delta=f"{weekly_adherence - target_adherence_percent:.2f}% vs Target"
         )
@@ -1544,6 +2159,55 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
         daily_cols = st.columns(7)
         for i, day_name in enumerate(day_order):
             daily_cols[i].metric(label=day_name, value=f"{daily_adherence.get(day_name, 0.0):.1f}%")
+
+        # Show break impact summary if break optimization was used
+        if adherence_metrics.get('break_optimization_used'):
+            with st.expander("📊 Break Impact Analysis", expanded=False):
+                st.info("Adherence metrics calculated using net staffing (after breaks). This shows the actual available headcount for customer service.")
+                
+                # Calculate break impact metrics
+                break_assignments = break_optimization_data.get('break_assignments', [])
+                if break_assignments:
+                    total_break_assignments = len(break_assignments)
+                    total_break_hours = sum(assignment['break_duration'] for assignment in break_assignments) / 60.0
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Break Assignments", total_break_assignments)
+                    with col2:
+                        st.metric("Total Break Hours", f"{total_break_hours:.1f} hrs")
+                    with col3:
+                        st.metric("Avg Break Duration", f"{total_break_hours/total_break_assignments*60:.0f} mins")
+                
+                st.markdown("**Break Assignments by Employee**")
+                # Create a summary of break assignments by employee
+                emp_break_summary = {}
+                for assignment in break_assignments:
+                    emp_name = assignment['employee']
+                    if emp_name not in emp_break_summary:
+                        emp_break_summary[emp_name] = {'total_breaks': 0, 'total_break_time': 0}
+                    emp_break_summary[emp_name]['total_breaks'] += 1
+                    emp_break_summary[emp_name]['total_break_time'] += assignment['break_duration']
+                
+                if emp_break_summary:
+                    summary_rows = []
+                    for emp, data in emp_break_summary.items():
+                        summary_rows.append({
+                            'Employee': emp,
+                            'Total Breaks': data['total_breaks'],
+                            'Total Break Time (mins)': data['total_break_time'],
+                            'Avg Break Duration (mins)': data['total_break_time'] / data['total_breaks']
+                        })
+                    
+                    summary_df = pd.DataFrame(summary_rows)
+                    st.dataframe(summary_df.style.format({
+                        'Total Break Time (mins)': '{:.0f}',
+                        'Avg Break Duration (mins)': '{:.1f}'
+                    }), use_container_width=True)
+        elif break_optimization_data:
+            st.info("Break optimization was performed, but net staffing data was not available for adherence calculation.")
+        else:
+            st.info("No break optimization data available. Adherence calculated using gross staffing levels.")
 
         st.markdown("---")
 
@@ -1557,6 +2221,9 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
 
             y_values = day_df['Capped Adherence (%)']
             colors = ['#2ca02c' if x >= 100 else ('#ff7f0e' if x > 0 else '#d62728') for x in y_values]
+            
+            # Add staffing type info to hover template
+            staffing_type_info = f" ({staffing_type})" if staffing_type != 'Gross' else ''
 
             fig_adherence = go.Figure()
             fig_adherence.add_trace(go.Bar(
@@ -1566,10 +2233,11 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
                 name='Adherence',
                 hovertemplate=(
                     "<b>%{x}</b><br>"
+                    f"Staffing Type: {staffing_type}<br>"
                     "Inflated Required: %{customdata[0]}<br>"
                     "Scheduled: %{customdata[1]}<br>"
                     "Raw Adherence: %{customdata[2]:.1f}%<br>"
-                    "<b>Capped Adherence: %{y:.1f}%</b><extra></extra>"
+                    f"<b>Capped Adherence{staffing_type_info}: %{{y:.1f}}%</b><extra></extra>"
                 ),
                 customdata=day_df[['Required', 'Scheduled', 'Raw Adherence (%)']].values
             ))
@@ -1579,7 +2247,7 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
                                         line=dict(color="black", width=2, dash="dash"), name="100% Target")
 
             fig_adherence.update_layout(
-                title=f"Line Adherence for {selected_day} (Capped at {adherence_cap_percent}%)",
+                title=f"Line Adherence for {selected_day} ({staffing_type} Staffing, Capped at {adherence_cap_percent}%)",
                 xaxis_title="Time Interval",
                 yaxis_title="Capped Adherence %",
                 yaxis_range=[0, adherence_cap_percent * 1.1],
@@ -1589,8 +2257,14 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
 
         with tab_table_adherence:
             st.markdown("**Detailed Adherence Calculation Data**")
-            st.info("This table shows how adherence is calculated against the inflated requirement, including capping, aligning with the solver's logic.")
-            st.dataframe(adherence_df.style.format({
+            st.info(f"This table shows how adherence is calculated against the inflated requirement, including capping. Using {staffing_type.lower()} staffing levels." + (" (Net staffing reflects actual available headcount after scheduled breaks)" if staffing_type == "Net (After Breaks)" else ""))
+            
+            # Add staffing type column to the display dataframe if not already present
+            display_df = adherence_df.copy()
+            if 'Staffing Type' not in display_df.columns:
+                display_df['Staffing Type'] = staffing_type
+            
+            st.dataframe(display_df.style.format({
                 'Raw Adherence (%)': '{:.2f}%',
                 'Capped Adherence (%)': '{:.2f}%',
                 'Capped Scheduled Contribution': '{:.2f}'
@@ -1600,7 +2274,7 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
                 vmin=0,
                 vmax=adherence_cap_percent
             ), use_container_width=True, height=500)
-            download_dataframe_csv(adherence_df, f"{key_prefix}_adherence_details")
+            download_dataframe_csv(display_df, f"{key_prefix}_adherence_details")
 
 
     st.subheader("Schedule vs. Requirement Deep Dive")
@@ -1630,18 +2304,135 @@ def display_comprehensive_results(solution_data, cost_data, requirements_data, k
 
     with tab_charts:
         st.markdown("##### Base, Inflated & Scheduled Staff")
-        # --- Full week view restored ---
+        
+        # Check if break optimization was performed and get net staffing
+        net_staffing_matrix = None
+        break_optimization = solution_data.get('break_optimization')
+        if break_optimization and break_optimization.get('net_staffing_matrix') is not None:
+            net_staffing_matrix = break_optimization['net_staffing_matrix']
+            st.success("✅ Showing Pass 2 results: Net Scheduled = Gross Scheduled - Staff on Break")
+        elif break_optimization:
+            st.info("📊 Break optimization ran, but net staffing matrix not available. Showing gross scheduled.")
+        
+        # Create the main chart
         fig = make_subplots(rows=7, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=day_order)
         for d in range(7):
             if has_base_req:
                 fig.add_trace(go.Scatter(x=intervals_str, y=base_req_matrix[d, :], mode='lines', name='Base Required', line=dict(color='gray', dash='dot')), row=d+1, col=1)
             fig.add_trace(go.Scatter(x=intervals_str, y=inflated_req_matrix[d, :], mode='lines', name='Inflated Required', line=dict(color='blue', dash='dash')), row=d+1, col=1)
-            fig.add_trace(go.Scatter(x=intervals_str, y=sched_matrix[d, :], mode='lines', name='Scheduled', line=dict(color='green')), row=d+1, col=1)
-        fig.update_layout(height=1400, title_text="Daily Required vs. Scheduled Staff Levels", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            fig.add_trace(go.Scatter(x=intervals_str, y=sched_matrix[d, :], mode='lines', name='Gross Scheduled', line=dict(color='green')), row=d+1, col=1)
+            
+            # Add Net Scheduled line if available from Pass 2
+            if net_staffing_matrix is not None:
+                fig.add_trace(go.Scatter(x=intervals_str, y=net_staffing_matrix[d, :], mode='lines', name='Net Scheduled (After Breaks)', line=dict(color='red', width=2)), row=d+1, col=1)
+        
+        fig.update_layout(
+            height=1400,
+            title_text="Daily Required vs. Scheduled Staff Levels" + (" (with Pass 2 Break Optimization)" if net_staffing_matrix is not None else ""),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         # Hide duplicate legends
         for trace in fig.data[3:]:
             trace.showlegend = False
         st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_daily_plot")
+        
+        # Add Pass 2 summary if break optimization was performed
+        if break_optimization and break_optimization.get('break_assignments'):
+            st.markdown("##### Pass 2 Break Optimization Summary")
+            break_assignments = break_optimization['break_assignments']
+            
+            # Create summary metrics by break sequence
+            break_sequence_summary = {}
+            break_names_summary = {}
+            
+            for assignment in break_assignments:
+                # Summary by break sequence (shift length)
+                shift_key = f"{assignment['shift_length']}hr shift"
+                if shift_key not in break_sequence_summary:
+                    break_sequence_summary[shift_key] = {'count': 0, 'total_duration': 0}
+                break_sequence_summary[shift_key]['count'] += 1
+                break_sequence_summary[shift_key]['total_duration'] += assignment['break_duration']
+                
+                # Summary by break name
+                break_name = assignment.get('break_name', 'Unknown')
+                if break_name not in break_names_summary:
+                    break_names_summary[break_name] = {'count': 0, 'total_duration': 0}
+                break_names_summary[break_name]['count'] += 1
+                break_names_summary[break_name]['total_duration'] += assignment['break_duration']
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Break Assignments", len(break_assignments))
+            
+            with col2:
+                # Calculate average break duration
+                avg_break_duration = sum(assignment['break_duration'] for assignment in break_assignments) / len(break_assignments) if break_assignments else 0
+                st.metric("Average Break Duration", f"{avg_break_duration:.0f} minutes")
+            
+            with col3:
+                # Calculate maximum staff on break at once (approximate)
+                max_concurrent_breaks = 0
+                if net_staffing_matrix is not None:
+                    for d in range(7):
+                        for p in range(len(intervals_str)):
+                            gross = sched_matrix[d, p]
+                            net = net_staffing_matrix[d, p]
+                            concurrent_breaks = gross - net
+                            max_concurrent_breaks = max(max_concurrent_breaks, concurrent_breaks)
+                st.metric("Max Concurrent Breaks", max_concurrent_breaks)
+            
+            with col4:
+                # Show number of different shift lengths with breaks
+                st.metric("Shift Lengths with Breaks", len(break_sequence_summary))
+            
+            # Display break sequence summary
+            st.markdown("##### Break Sequence Summary by Shift Length")
+            sequence_data = []
+            for shift_type, data in break_sequence_summary.items():
+                sequence_data.append({
+                    'Shift Length': shift_type,
+                    'Total Breaks': data['count'],
+                    'Total Break Time (mins)': data['total_duration'],
+                    'Avg Breaks per Employee': data['count'] / len(set(assignment['employee'] for assignment in break_assignments if f"{assignment['shift_length']}hr shift" == shift_type))
+                })
+            
+            sequence_df = pd.DataFrame(sequence_data)
+            st.dataframe(sequence_df.style.format({
+                'Total Break Time (mins)': '{:.0f}',
+                'Avg Breaks per Employee': '{:.2f}'
+            }), use_container_width=True)
+            
+            # Display break name distribution
+            if len(break_names_summary) > 1:
+                st.markdown("##### Break Name Distribution")
+                name_data = []
+                for break_name, data in break_names_summary.items():
+                    name_data.append({
+                        'Break Name': break_name,
+                        'Count': data['count'],
+                        'Total Duration (mins)': data['total_duration'],
+                        'Avg Duration (mins)': data['total_duration'] / data['count']
+                    })
+                
+                name_df = pd.DataFrame(name_data)
+                st.dataframe(name_df.style.format({
+                    'Total Duration (mins)': '{:.0f}',
+                    'Avg Duration (mins)': '{:.1f}'
+                }), use_container_width=True)
+            
+            # Show sample break assignments
+            with st.expander("View Sample Break Assignments", expanded=False):
+                sample_assignments = pd.DataFrame(break_assignments[:10])  # Show first 10
+                if not sample_assignments.empty:
+                    display_columns = ['employee', 'day', 'shift_start', 'break_name', 'break_order', 'break_start', 'break_end', 'break_duration']
+                    available_columns = [col for col in display_columns if col in sample_assignments.columns]
+                    sample_assignments['shift_start'] = sample_assignments['shift_start'].dt.strftime('%H:%M')
+                    sample_assignments['break_start'] = sample_assignments['break_start'].dt.strftime('%H:%M')
+                    sample_assignments['break_end'] = sample_assignments['break_end'].dt.strftime('%H:%M')
+                    st.dataframe(sample_assignments[available_columns], use_container_width=True)
+                else:
+                    st.info("No break assignments to display.")
 
     with tab_heatmap:
         st.markdown("##### Over/Understaffing Heatmap (vs. Inflated Requirement)")
@@ -2038,11 +2829,339 @@ with tab1:
         st.markdown("---")
         st.markdown("#### Base Workload Volume (Used for all scenarios above)")
         
-        # Apply safe update to single channel dataframe
-        if "single_channel_df" not in st.session_state or list(st.session_state["single_channel_df"].columns) != input_dates_str:
-            safe_update_dataframe("single_channel_df", input_dates_str, interval_index_str)
+        # Choose AHT Input Method
+        aht_input_option = st.radio("Choose AHT Input Method:",
+                                   ("Multiple AHT values for all intervals and days", "AHT table at interval level for each day"),
+                                   key="aht_input_method", horizontal=True)
+        
+        # Initialize AHT DataFrame if using interval-level AHT
+        if aht_input_option == "AHT table at interval level for each day":
+            if "aht_df" not in st.session_state:
+                data_aht = {day: [0.0]*len(interval_index_str) for day in input_dates_str}
+                aht_df = pd.DataFrame(data_aht, index=interval_index_str)
+                st.session_state["aht_df"] = aht_df
+            st.markdown("### AHT per Interval")
+            st.session_state["aht_df"] = st.data_editor(st.session_state["aht_df"], key="aht_df_editor", height=300, use_container_width=True)
+        
+        # Choose Volume Input Method
+        volume_input_option = st.radio("Choose Volume Input Method:",
+                                      ("Manual Volume Input", "Auto Input Calls Offered per Interval"),
+                                      key="volume_input_method", horizontal=True)
+        
+        if volume_input_option == "Auto Input Calls Offered per Interval":
+            st.subheader("Using Weekly Volume + Distributions")
+            
+            # Calculate number of weeks based on selected date range
+            num_weeks = (end_date - start_date).days // 7 + 1
+            
+            with st.expander("📊 Weekly Volume Configuration", expanded=True):
+                st.info("📅 **Weekly Volume Setup**: Configure the total volume for each week in your selected date range. Each week can have a different volume based on your forecast.")
+                
+                weekly_volumes_dict = {}
+                
+                if num_weeks == 1:
+                    # Single week - simple input with better labeling
+                    st.markdown(f"**📆 Single Week: Week of {start_date.strftime('%Y-%m-%d')}**")
+                    weekly_volume = st.number_input(
+                        "Total Weekly Volume",
+                        min_value=0,
+                        value=800,
+                        step=100,
+                        key="weekly_volume",
+                        help="Enter the total expected volume for this week"
+                    )
+                    # Use the week start as key for consistency
+                    week_start = get_week_start(start_date, st.session_state.week_start_day)
+                    week_key = week_start.strftime('%Y-%m-%d')
+                    weekly_volumes_dict[week_key] = weekly_volume
+                    
+                    # Show a simple summary for single week
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Week Starting", week_key)
+                    with col2:
+                        st.metric("Weekly Volume", f"{weekly_volume:,.0f}")
+                else:
+                    # Multiple weeks - individual inputs for each week with better organization
+                    st.markdown(f"**📅 Multiple Weeks Configuration ({num_weeks} weeks)**")
+                    st.markdown("Configure volume for each week individually. Each week's volume will be distributed across its days below.")
+                    
+                    # Create volume inputs for each unique week with better organization
+                    weeks_processed = set()
+                    for date_str in input_dates_str:
+                        date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                        week_start = get_week_start(date_obj, st.session_state.week_start_day)
+                        week_key = week_start.strftime('%Y-%m-%d')
+                        
+                        # Only create input once per week
+                        if week_key not in weeks_processed:
+                            weeks_processed.add(week_key)
+                            
+                            # Calculate date range for this week
+                            week_end = week_start + datetime.timedelta(days=6)
+                            week_dates_in_range = []
+                            for i in range(7):
+                                current_date = week_start + datetime.timedelta(days=i)
+                                if start_date <= current_date <= end_date:
+                                    week_dates_in_range.append(current_date.strftime('%Y-%m-%d'))
+                            
+                            dates_in_range_str = f" (📅 {len(week_dates_in_range)} days in range: {week_dates_in_range[0]} to {week_dates_in_range[-1]})" if len(week_dates_in_range) > 0 else ""
+                            
+                            
+                            with st.container(border=True):
+                                st.markdown(f"**Week of {week_key}**{dates_in_range_str}")
+                                week_vol = st.number_input(
+                                    f"Weekly Volume for {week_key}",
+                                    min_value=0,
+                                    value=800,
+                                    step=100,
+                                    key=f"weekly_volume_{week_key}",
+                                    help=f"Total expected volume for the week of {week_key}"
+                                )
+                                weekly_volumes_dict[week_key] = week_vol
+                    
+                    st.markdown("---")
+                    st.markdown("##### 📊 Weekly Volume Summary")
+                    
+                    # Create summary with better formatting
+                    total_volume = sum(weekly_volumes_dict.values())
+                    summary_cols = st.columns([2, 1, 1])
+                    with summary_cols[0]:
+                        st.metric("📈 Total Volume Across All Weeks", f"{total_volume:,.0f}")
+                    with summary_cols[1]:
+                        st.metric("📊 Number of Weeks", f"{len(weekly_volumes_dict)}")
+                    with summary_cols[2]:
+                        st.metric("📅 Average per Week", f"{total_volume/len(weekly_volumes_dict):,.0f}" if weekly_volumes_dict else "0")
+                    
+                    # Show detailed weekly breakdown
+                    st.markdown("**Detailed Weekly Breakdown:**")
+                    vol_summary = pd.DataFrame([
+                        {
+                            "Week Starting": week,
+                            "Weekly Volume": f"{vol:,.0f}",
+                            "Volume %": f"{(vol/total_volume*100):.1f}%" if total_volume > 0 else "0%"
+                        }
+                        for week, vol in weekly_volumes_dict.items()
+                    ])
+                    st.dataframe(vol_summary, use_container_width=True)
+                    
+                    # Validation check
+                    if total_volume == 0:
+                        st.warning("⚠️ Total volume is 0. Please enter volumes for at least one week.")
 
-        st.session_state["single_channel_df"] = st.data_editor(st.session_state["single_channel_df"], key="single_channel_editor", height=300, use_container_width=True)
+            with st.expander("📅 Weekly Distribution Configuration", expanded=True):
+                st.info("📊 **Daily Distribution Setup**: Configure how the weekly volume should be distributed across each day of the week. Percentages will be automatically adjusted to sum to 100% for each week.")
+                
+                weekly_distributions_dict = {}
+                
+                if num_weeks == 1:
+                    # Single week - simple input with better labeling
+                    st.markdown(f"**📆 Week of {start_date.strftime('%Y-%m-%d')} - Daily Distribution**")
+                    distribution_data = pd.DataFrame({
+                        "Day": [datetime.datetime.strptime(date_str, '%Y-%m-%d').strftime('%A') for date_str in input_dates_str],
+                        "Percentage": [15.0 if i < len(input_dates_str) else 0 for i in range(len(input_dates_str))]
+                    })
+                    distribution_data["Percentage"] = distribution_data["Percentage"].astype(float)
+                    distribution_data = st.data_editor(distribution_data, key="distribution_data_editor")
+                    
+                    # Adjust distribution to sum to 100%
+                    total_percentage = distribution_data["Percentage"].sum()
+                    if total_percentage > 0:
+                        distribution_data["Adjusted Percentage"] = distribution_data["Percentage"] / total_percentage * 100
+                    else:
+                        distribution_data["Adjusted Percentage"] = distribution_data["Percentage"]
+                    
+                    # Show summary
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("📊 Total Percentage", f"{total_percentage:.1f}%")
+                    with col2:
+                        st.metric("✅ Validation", "Valid" if abs(total_percentage - 100.0) < 0.001 else "Needs Adjustment")
+                    
+                    st.dataframe(distribution_data)
+                else:
+                    # Multiple weeks - individual inputs for each week with better organization
+                    st.markdown(f"**📅 Multiple Weeks - Individual Daily Distributions ({num_weeks} weeks)**")
+                    st.markdown("Configure daily distribution patterns for each week. Each week can have a different distribution pattern based on your business needs.")
+                    
+                    # Create distribution inputs for each unique week with better organization
+                    weeks_processed = set()
+                    for date_str in input_dates_str:
+                        date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                        week_start = get_week_start(date_obj, st.session_state.week_start_day)
+                        week_key = week_start.strftime('%Y-%m-%d')
+                        
+                        # Only create input once per week
+                        if week_key not in weeks_processed:
+                            weeks_processed.add(week_key)
+                            
+                            # Get days for this specific week
+                            week_dates = []
+                            for j in range(7):
+                                week_date = week_start + datetime.timedelta(days=j)
+                                week_dates.append(week_date.strftime('%Y-%m-%d'))
+                            
+                            # Filter to only include dates that fall within our selected range
+                            filtered_week_dates = [d for d in week_dates if d in input_dates_str]
+                            
+                            # Create display with better formatting
+                            with st.container(border=True):
+                                st.markdown(f"**📅 Week of {week_key}**")
+                                st.markdown(f"📊 Days in range: {', '.join([datetime.datetime.strptime(d, '%Y-%m-%d').strftime('%m/%d (%a)') for d in filtered_week_dates])}")
+                                
+                                week_distribution_data = pd.DataFrame({
+                                    "Day": [datetime.datetime.strptime(d, '%Y-%m-%d').strftime('%a %m/%d') for d in filtered_week_dates],
+                                    "Percentage": [15.0] * len(filtered_week_dates)
+                                })
+                                week_distribution_data["Percentage"] = week_distribution_data["Percentage"].astype(float)
+                                
+                                # Edit this week's distribution
+                                edited_week_data = st.data_editor(
+                                    week_distribution_data,
+                                    key=f"distribution_data_editor_{week_key}",
+                                    use_container_width=True
+                                )
+                                
+                                # Adjust this week's distribution to sum to 100%
+                                total_week_percentage = edited_week_data["Percentage"].sum()
+                                if total_week_percentage > 0:
+                                    edited_week_data["Adjusted Percentage"] = edited_week_data["Percentage"] / total_week_percentage * 100
+                                else:
+                                    edited_week_data["Adjusted Percentage"] = edited_week_data["Percentage"]
+                                
+                                # Show validation for this week
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("📊 Total %", f"{total_week_percentage:.1f}%")
+                                with col2:
+                                    validation_status = "✅ Valid" if abs(total_week_percentage - 100.0) < 0.001 else "⚠️ Needs Check"
+                                    st.metric("Status", validation_status)
+                                
+                                st.dataframe(edited_week_data)
+                                weekly_distributions_dict[week_key] = edited_week_data
+                    
+                    st.markdown("---")
+                    st.markdown("##### 📊 Distribution Summary - All Weeks")
+                    
+                    # Show summary table for all weeks with better formatting
+                    summary_rows = []
+                    for week_key, week_data in weekly_distributions_dict.items():
+                        total_pct = week_data["Adjusted Percentage"].sum()
+                        summary_rows.append({
+                            "Week Starting": week_key,
+                            "Total %": f"{total_pct:.1f}%",
+                            "Days": len(week_data),
+                            "Status": "✅ Valid" if abs(total_pct - 100.0) < 0.001 else "⚠️ Invalid"
+                        })
+                    
+                    if summary_rows:
+                        summary_df = pd.DataFrame(summary_rows)
+                        st.dataframe(summary_df, use_container_width=True)
+                        
+                        # Overall validation summary
+                        all_valid = all(abs(float(row["Total %"].replace('%', '').strip()) - 100.0) < 0.001 for row in summary_rows)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("📊 Weeks Configured", f"{len(summary_rows)}")
+                        with col2:
+                            valid_count = sum(1 for row in summary_rows if row["Status"] == "✅ Valid")
+                            st.metric("✅ Valid Weeks", f"{valid_count}/{len(summary_rows)}")
+                        with col3:
+                            if all_valid:
+                                st.success("🎉 All distributions valid!")
+                            else:
+                                st.warning("⚠️ Some weeks need attention")
+                        
+                        if not all_valid:
+                            st.markdown("**💡 Tips for fixing distributions:**")
+                            st.markdown("- Ensure each week's percentages sum to 100%")
+                            st.markdown("- You can use the auto-adjust feature by setting percentages that don't sum to 100%")
+                            st.markdown("- The system will normalize them automatically")
+
+            with st.expander("Interval Distribution (Daily)", expanded=True):
+                initial_data = [[2.08 for _ in input_dates_str] for _ in interval_index_str]
+                percentage_df = pd.DataFrame(initial_data, index=interval_index_str, columns=input_dates_str)
+                
+                # Ensure each column sums to 100% by normalizing
+                for day in percentage_df.columns:
+                    total_pct = percentage_df[day].sum()
+                    if total_pct == 0:
+                        continue
+                    percentage_df[day] = percentage_df[day] / total_pct * 100
+                
+                percentage_df = st.data_editor(percentage_df, key="percentage_df_editor")
+                
+                # Generate calls DataFrame
+                calls_df = pd.DataFrame(index=interval_index_str)
+                
+                # Create daily volumes using the appropriate weekly volume and distribution for each day
+                daily_volumes = []
+                for i, date_str in enumerate(st.session_state.get('input_dates_str', input_dates_str)):
+                    # Get the week for this date
+                    date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                    week_start = get_week_start(date_obj, st.session_state.week_start_day)
+                    week_key = week_start.strftime('%Y-%m-%d')
+                    
+                    # Get the weekly volume for this week - with better error handling
+                    if week_key not in weekly_volumes_dict:
+                        st.error(f"Missing weekly volume for week {week_key} (containing date {date_str})")
+                        weekly_vol = 0
+                    else:
+                        weekly_vol = weekly_volumes_dict[week_key]
+                    
+                    # Get the appropriate distribution data for this week
+                    if num_weeks == 1:
+                        # Single week - use the single distribution_data
+                        dist_data = distribution_data
+                    else:
+                        # Multiple weeks - use week-specific distribution
+                        if week_key not in weekly_distributions_dict:
+                            st.error(f"Missing weekly distribution for week {week_key} (containing date {date_str})")
+                            # Create a default distribution with 0% for all days
+                            dist_data = pd.DataFrame({"Day": [date_obj.strftime('%A')], "Adjusted Percentage": [0.0]})
+                        else:
+                            dist_data = weekly_distributions_dict[week_key]
+                    
+                    # Find the distribution percentage for this specific date
+                    date_day_name = date_obj.strftime('%A')
+                    
+                    # Use robust day matching to handle various day name formats
+                    dist_row, match_type = robust_day_name_match(date_day_name, dist_data['Day'])
+                    
+                    if dist_row is not None and not dist_row.empty:
+                        # Safe access for DataFrame row - get the percentage from the original dist_data using the index
+                        if "Adjusted Percentage" in dist_data.columns and len(dist_row.index) > 0:
+                            # Get the actual row from dist_data using the matched index
+                            matched_idx = dist_row.index[0]  # Get the actual index from the matched row
+                            dist_pct = dist_data.loc[matched_idx, "Adjusted Percentage"] if "Adjusted Percentage" in dist_data.columns else 0.0
+                        else:
+                            # Fallback: distribute evenly among available days
+                            dist_pct = 100.0 / len(dist_data) if len(dist_data) > 0 else 0.0
+                        if match_type != 'exact':
+                            st.info(f"Matched '{date_day_name}' using {match_type.replace('_', ' ')} method")
+                    else:
+                        # Fallback if day not found - distribute evenly among available days
+                        available_days = len(dist_data)
+                        dist_pct = 100.0 / available_days if available_days > 0 else 0.0
+                        st.warning(f"Day {date_day_name} not found in week {week_key} distribution. Distributing evenly among {available_days} days.")
+                    
+                    daily_vol = weekly_vol * (dist_pct / 100)
+                    daily_volumes.append(daily_vol)
+                
+                for day, daily_volume in zip(input_dates_str, daily_volumes):
+                    calls_per_interval = [(daily_volume * (p / 100)) for p in percentage_df[day]]
+                    calls_df[day] = calls_per_interval
+                
+                st.session_state["single_channel_df"] = calls_df
+                st.data_editor(st.session_state["single_channel_df"], key="auto_calls_df_editor", height=300, use_container_width=True)
+        else:
+            # Apply safe update to single channel dataframe
+            if "single_channel_df" not in st.session_state or list(st.session_state["single_channel_df"].columns) != input_dates_str:
+                safe_update_dataframe("single_channel_df", input_dates_str, interval_index_str)
+
+            st.session_state["single_channel_df"] = st.data_editor(st.session_state["single_channel_df"], key="single_channel_editor", height=300, use_container_width=True)
+        
         download_dataframe_csv(st.session_state["single_channel_df"], "base_workload_volume")
 
         if st.button("Calculate Staffing for All Scenarios", type="primary", key="calc_all_scenarios"):
@@ -2068,6 +3187,14 @@ with tab1:
                         adjusted_volume_df = numeric_base_volume_df * (vol_adj_percent / 100.0)
                         # Store adjusted volume for potential use in Tab 4
                         params['base_volume_df'] = numeric_base_volume_df
+                        
+                        # Add AHT parameters if using interval-level AHT
+                        if aht_input_option == "AHT table at interval level for each day":
+                            params['use_interval_aht'] = True
+                            params['aht_df'] = st.session_state.aht_df.copy()
+                        else:
+                            params['use_interval_aht'] = False
+                            params['aht_df'] = None
 
                         staffing_df = run_staffing_calculation(params, input_dates_str, day_name_map, st.session_state.week_start_day, adjusted_volume_df)
                         all_scenarios_results[scenario_name] = (staffing_df, params)
@@ -2370,9 +3497,19 @@ with tab1:
                     st.markdown(f"#### {title_name}")
                     st.caption(f"Week of: {week_str}")
 
-                    summary_A = data_A['summary'].drop(columns=['Scenario', 'Week_Start_Day']).iloc[0].apply(pd.to_numeric, errors='coerce')
-                    summary_B = data_B['summary'].drop(columns=['Scenario', 'Week_Start_Day']).iloc[0].apply(pd.to_numeric, errors='coerce')
-                    summary_diff = summary_B - summary_A
+                    summary_A_df = data_A['summary'].drop(columns=['Scenario', 'Week_Start_Day'])
+                    summary_B_df = data_B['summary'].drop(columns=['Scenario', 'Week_Start_Day'])
+                    if len(summary_A_df) > 0 and len(summary_B_df) > 0:
+                        summary_A = summary_A_df.iloc[0].apply(pd.to_numeric, errors='coerce')
+                        summary_B = summary_B_df.iloc[0].apply(pd.to_numeric, errors='coerce')
+                        summary_diff = summary_B - summary_A
+                    else:
+                        st.error("Cannot calculate difference: summary data is empty")
+                        # Skip to next iteration if data is empty
+                        st.info("Skipping this comparison due to missing data.")
+                        # Don't execute the rest of the comparison logic
+                        # Return early to prevent further processing
+                        st.stop()
                     summary_diff_df = summary_diff.to_frame(name=f"Difference ({name_B}-{name_A})")
                     st.dataframe(summary_diff_df.style.format("{:,.2f}", na_rep="-"), use_container_width=True)
                     download_dataframe_csv(summary_diff_df, f"compare_{key_suffix}_summary_diff")
@@ -2914,20 +4051,186 @@ with tab2:
 
 
     with st.sidebar.expander("🎯 'Line Adherence' Model Settings (Pre-defined shifts only)", expanded=False):
-        st.info("Only applicable when using 'Use Pre-defined Shifts' mode.")
-        enable_adherence_model = st.checkbox("Enable Line Adherence Scheduling Model", value=st.session_state.get('enable_adherence', False), key="enable_adherence", disabled=(schedule_generation_mode != "Use Pre-defined Shifts"))
-
-        adherence_level_options = ["Day", "Week"]
-        default_adherence_level = st.session_state.get('adherence_target_level', 'Day')
-        try:
-            default_adherence_idx = adherence_level_options.index(default_adherence_level)
-        except ValueError:
-            default_adherence_idx = 0
-
-        if enable_adherence_model:
-            st.radio("Target Level", options=adherence_level_options, index=default_adherence_idx, horizontal=True, help="Choose 'Day' for consistent daily adherence. Choose 'Week' for flexibility.", key="adherence_target_level")
-            st.slider("Line Adherence Target (%)", 80, 120, value=st.session_state.get('adherence_target_percent', 95), key="adherence_target_percent")
-            st.slider("Interval Overstaffing Cap (%)", 100, 200, value=st.session_state.get('adherence_cap_percent', 105), key="adherence_cap_percent")
+            st.info("Only applicable when using 'Use Pre-defined Shifts' mode.")
+            enable_adherence_model = st.checkbox("Enable Line Adherence Scheduling Model", value=st.session_state.get('enable_adherence', False), key="enable_adherence", disabled=(schedule_generation_mode != "Use Pre-defined Shifts"))
+    
+            adherence_level_options = ["Day", "Week"]
+            default_adherence_level = st.session_state.get('adherence_target_level', 'Day')
+            try:
+                default_adherence_idx = adherence_level_options.index(default_adherence_level)
+            except ValueError:
+                default_adherence_idx = 0
+    
+            if enable_adherence_model:
+                st.radio("Target Level", options=adherence_level_options, index=default_adherence_idx, horizontal=True, help="Choose 'Day' for consistent daily adherence. Choose 'Week' for flexibility.", key="adherence_target_level")
+                st.slider("Line Adherence Target (%)", 80, 120, value=st.session_state.get('adherence_target_percent', 95), key="adherence_target_percent")
+                st.slider("Interval Overstaffing Cap (%)", 100, 200, value=st.session_state.get('adherence_cap_percent', 105), key="adherence_cap_percent")
+    
+        # --- NEW: Pass 2 Break Optimization Configuration ---
+    with st.sidebar.expander("🕐 Pass 2: Break & Lunch Optimization", expanded=False):
+            st.info("Configure break optimization rules and execute Pass 2 to optimize break times for scheduled staff.")
+            
+            # Enable/Disable Pass 2
+            # Note: The checkbox manages its own state through the key parameter
+            # Do NOT assign the return value to session_state directly
+            pass2_enabled = st.checkbox(
+                "Enable Pass 2 Break Optimization",
+                value=st.session_state.get('pass2_break_optimization', False),
+                key="pass2_break_optimization_checkbox",
+                help="Enable to run break optimization after schedule generation"
+            )
+            # Update session state based on checkbox value
+            st.session_state.pass2_break_optimization = pass2_enabled
+            
+            if pass2_enabled:
+                st.markdown("##### Break Sequence Configuration")
+                st.info("Define complete break sequences for different shift lengths. Each sequence lists breaks in the order they should occur during the shift.")
+                
+                # Helper function to generate example sequences
+                def get_example_sequences():
+                    return {
+                        "6-8 hours": "Tea Break 1: 15 mins | Lunch Break: 30 mins",
+                        "8-10 hours": "Tea Break 1: 15 mins | Lunch Break: 45 mins | Tea Break 2: 15 mins",
+                        "10-12 hours": "Tea Break 1: 15 mins | Lunch Break: 45 mins | Tea Break 2: 15 mins | Dinner Break: 30 mins"
+                    }
+                
+                # Quick setup buttons
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Quick Setup: Standard Office Hours (6-8 hrs)", key="quick_setup_standard"):
+                        st.session_state.break_sequences_df = pd.DataFrame([
+                            {
+                                'Min Shift Length (hrs)': 6.0,
+                                'Max Shift Length (hrs)': 8.0,
+                                'Break Sequence': 'Tea Break 1: 15 mins | Lunch Break: 30 mins',
+                                'Break Order': 'Tea Break 1 (15m) → Lunch Break (30m)'
+                            }
+                        ])
+                        st.rerun()
+                
+                with col2:
+                    if st.button("Quick Setup: Extended Hours (8-12 hrs)", key="quick_setup_extended"):
+                        st.session_state.break_sequences_df = pd.DataFrame([
+                            {
+                                'Min Shift Length (hrs)': 8.0,
+                                'Max Shift Length (hrs)': 12.0,
+                                'Break Sequence': 'Tea Break 1: 15 mins | Lunch Break: 45 mins | Tea Break 2: 15 mins | Dinner Break: 30 mins',
+                                'Break Order': 'Tea Break 1 (15m) → Lunch Break (45m) → Tea Break 2 (15m) → Dinner Break (30m)'
+                            }
+                        ])
+                        st.rerun()
+                
+                # Example format helper
+                with st.expander("📝 Format Examples & Help", expanded=False):
+                    st.markdown("#### Break Sequence Format")
+                    st.info("""
+                    **Format**: `Break Name: Duration | Break Name: Duration | ...`
+                    
+                    **Examples**:
+                    - `Tea Break 1: 15 mins | Lunch Break: 30 mins`
+                    - `Coffee Break: 10 mins | Lunch: 45 mins | Afternoon Break: 15 mins`
+                    - `Breakfast Break: 15 mins | Lunch Break: 60 mins | Dinner Break: 30 mins`
+                    
+                    **Rules**:
+                    - Use `|` to separate different breaks
+                    - Include duration (e.g., `15 mins`, `30 minutes`, `1 hour`)
+                    - Breaks will be scheduled in the order listed
+                    """)
+                    
+                    # Show examples in a table
+                    examples = get_example_sequences()
+                    example_data = []
+                    for shift_range, sequence in examples.items():
+                        example_data.append({
+                            'Shift Length Range': shift_range,
+                            'Break Sequence': sequence
+                        })
+                    
+                    st.dataframe(pd.DataFrame(example_data), use_container_width=True)
+                
+                # Edit break sequences DataFrame
+                edited_sequences_df = st.data_editor(
+                    st.session_state.break_sequences_df,
+                    key="break_sequences_editor",
+                    column_config={
+                        "Min Shift Length (hrs)": st.column_config.NumberColumn(min_value=1.0, max_value=16.0, step=0.5, help="Minimum shift length for this break sequence"),
+                        "Max Shift Length (hrs)": st.column_config.NumberColumn(min_value=1.0, max_value=16.0, step=0.5, help="Maximum shift length for this break sequence"),
+                        "Break Sequence": st.column_config.TextColumn(help="Complete break sequence in order (e.g., 'Tea Break: 15 mins | Lunch: 30 mins')", required=True),
+                        "Break Order": st.column_config.TextColumn(help="Human-readable order description (optional, for display only)")
+                    },
+                    use_container_width=True,
+                    num_rows="dynamic"
+                )
+                
+                # Update session state
+                st.session_state.break_sequences_df = edited_sequences_df.copy()
+                
+                st.markdown("##### Global Break Constraints")
+                
+                # Max concurrency slider
+                st.slider(
+                    "Max % of staff on break per interval",
+                    min_value=10.0,
+                    max_value=100.0,
+                    value=st.session_state.get('max_concurrency_pct', 30.0),
+                    step=5.0,
+                    key="max_concurrency_pct",
+                    help="Maximum percentage of scheduled staff that can be on break simultaneously"
+                )
+                
+                # Advanced constraint settings
+                st.markdown("##### Advanced Scheduling Constraints")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Minimum time between consecutive breaks
+                    st.slider(
+                        "Min time between consecutive breaks (mins)",
+                        min_value=0,
+                        max_value=120,
+                        value=30,
+                        step=15,
+                        key="min_break_interval",
+                        help="Minimum time that must pass between consecutive breaks in a sequence"
+                    )
+                    
+                    # Allow break sequence flexibility
+                    st.checkbox(
+                        "Allow flexible break timing",
+                        value=True,
+                        key="flexible_break_timing",
+                        help="Allow breaks to be moved within reasonable bounds to optimize staffing"
+                    )
+                
+                with col2:
+                    # Break window flexibility
+                    st.slider(
+                        "Break window flexibility (% of shift)",
+                        min_value=5,
+                        max_value=25,
+                        value=15,
+                        step=5,
+                        key="break_window_flexibility",
+                        help="How much flexibility to allow when scheduling breaks within their optimal windows"
+                    )
+                    
+                    # Minimum break coverage
+                    st.checkbox(
+                        "Ensure minimum break coverage",
+                        value=True,
+                        key="ensure_minimum_coverage",
+                        help="Prioritize ensuring all employees get their required breaks over perfect timing"
+                    )
+                
+                # Execute Pass 2 button (will be shown when schedule is available)
+                if 'scheduling_solutions' in st.session_state and st.session_state.scheduling_solutions:
+                    if st.button("Execute Pass 2: Optimize Breaks", key="execute_pass2"):
+                        st.info("Pass 2 will be executed automatically during schedule generation when enabled.")
+                        st.info("To run Pass 2 on existing schedules, regenerate the schedules with Pass 2 enabled above.")
+                else:
+                    if st.button("Execute Pass 2: Optimize Breaks", key="execute_pass2", disabled=True):
+                        pass
+                    st.info("Generate a schedule first, then Pass 2 will run automatically during schedule generation.")
 
     st.markdown("#### 1. Select Requirement Input Source")
     input_source_options = ("Use Staffing Forecast from Tab 1", "Manually Enter Requirements")
@@ -3094,6 +4397,8 @@ with tab2:
                     display_name = f"Manual Input | Week of {week_start_dt.strftime('%Y-%m-%d') if hasattr(week_start_dt, 'strftime') else week_start_dt}"
 
                 base_hc = math.ceil(job.get('Required HC (Avg)', job.get('avg_fte', 0)))
+                # Ensure base_hc is at least 1 to avoid StreamlitValueBelowMinError
+                base_hc = max(1, base_hc)
 
                 st.session_state.adjusted_headcounts[display_name] = st.number_input(
                     f"**Final number of employees for: {display_name.split(' | HC:')[0]}**",
@@ -3263,9 +4568,103 @@ with tab2:
                         if solution.get('status') in ['OPTIMAL', 'FEASIBLE']:
                             cost_breakdown, cost_details, weekly_hours_df = calculate_schedule_cost(solution['roster_df'], virtual_shifts, cost_config, week_start_dt, days_of_week_ordered)
                             solution['config'] = line_adherence_config if model_type == 'line_adherence' else None
-                            all_solutions[key][model_type] = {'solution': solution, 'requirements': requirements_to_store, 'cost': (cost_breakdown, cost_details, weekly_hours_df), 'virtual_shifts_used': virtual_shifts, 'forecast_df': full_staffing_df, 'forecast_params': forecast_params}
+                            
+                            # --- PASS 2 INTEGRATION: Run break optimization if enabled ---
+                            break_optimization_result = None
+                            if st.session_state.pass2_break_optimization and st.session_state.break_sequences_df is not None:
+                                try:
+                                    with st.spinner(f"Running Pass 2 break sequence optimization for {model_type}..."):
+                                        break_optimization_result = optimize_breaks_ortools(
+                                            solution['roster_df'],
+                                            np.array(inflated_req_matrix),
+                                            st.session_state.break_sequences_df,
+                                            st.session_state.max_concurrency_pct,
+                                            st.session_state.get('min_break_interval', 30),
+                                            st.session_state.get('flexible_break_timing', True),
+                                            st.session_state.get('break_window_flexibility', 15),
+                                            st.session_state.get('ensure_minimum_coverage', True)
+                                        )
+                                        
+                                        if break_optimization_result.get('status') in ['OPTIMAL', 'FEASIBLE']:
+                                            # Update roster to include break sequences
+                                            updated_roster = solution['roster_df'].copy()
+                                            
+                                            # Group break assignments by employee and day, maintaining order
+                                            break_assignments = break_optimization_result.get('break_assignments', [])
+                                            employee_day_sequences = {}
+                                            
+                                            for assignment in break_assignments:
+                                                emp_name = assignment['employee']
+                                                day = assignment['day']
+                                                break_name = assignment['break_name']
+                                                break_order = assignment['break_order']
+                                                break_start = assignment['break_start'].strftime('%H:%M')
+                                                break_end = assignment['break_end'].strftime('%H:%M')
+                                                break_duration = assignment['break_duration']
+                                                
+                                                key = (emp_name, day)
+                                                if key not in employee_day_sequences:
+                                                    employee_day_sequences[key] = []
+                                                employee_day_sequences[key].append({
+                                                    'name': break_name,
+                                                    'order': break_order,
+                                                    'start': break_start,
+                                                    'end': break_end,
+                                                    'duration': break_duration
+                                                })
+                                            
+                                            # Sort breaks by order within each employee-day combination
+                                            for key in employee_day_sequences:
+                                                employee_day_sequences[key].sort(key=lambda x: x['order'])
+                                            
+                                            # Update roster with break sequences
+                                            for (emp_name, day), breaks in employee_day_sequences.items():
+                                                if emp_name in updated_roster['Employee'].values and day in updated_roster.columns:
+                                                    shift_match = updated_roster.loc[updated_roster['Employee'] == emp_name, day]
+                                                    if len(shift_match) > 0:
+                                                        current_shift = str(shift_match.iloc[0])
+                                                        if current_shift != 'OFF':
+                                                            # Parse existing shift info and add break details
+                                                            start_time, shift_length = parse_shift_info(current_shift)
+                                                            if start_time is not None and shift_length is not None:
+                                                                # Create enhanced shift text with break sequence
+                                                                end_time = (datetime.datetime.combine(datetime.date.today(), start_time) +
+                                                                           datetime.timedelta(hours=shift_length)).time()
+                                                                shift_text = f"{start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')} ({shift_length}hr)"
+                                                                
+                                                                # Add break sequence information in order
+                                                                break_sequence_texts = []
+                                                                for break_info in breaks:
+                                                                    break_sequence_texts.append(f"{break_info['name']}: {break_info['start']}-{break_info['end']} ({break_info['duration']}m)")
+                                                                
+                                                                if break_sequence_texts:
+                                                                    if len(break_sequence_texts) == 1:
+                                                                        updated_shift = f"{shift_text} | {break_sequence_texts[0]}"
+                                                                    else:
+                                                                        updated_shift = f"{shift_text} | " + " → ".join(break_sequence_texts)
+                                                                else:
+                                                                    updated_shift = shift_text
+                                                                
+                                                                updated_roster.loc[updated_roster['Employee'] == emp_name, day] = updated_shift
+                                                            
+                                            solution['roster_df'] = updated_roster
+                                            
+                                            # Store break optimization results
+                                            solution['break_optimization'] = break_optimization_result
+                                            
+                                            # Calculate statistics
+                                            unique_employees = len(employee_day_sequences)
+                                            total_breaks = len(break_assignments)
+                                            st.success(f"✅ Pass 2 completed: {total_breaks} breaks optimized across {unique_employees} employee shifts")
+                                        else:
+                                            st.warning(f"⚠️ Pass 2 failed: {break_optimization_result.get('reason', 'Unknown error')}")
+                                            
+                                except Exception as e:
+                                    st.error(f"❌ Pass 2 error: {str(e)}")
+                            
+                            all_solutions[key][model_type] = {'solution': solution, 'requirements': requirements_to_store, 'cost': (cost_breakdown, cost_details, weekly_hours_df), 'virtual_shifts_used': virtual_shifts, 'forecast_df': full_staffing_df, 'forecast_params': forecast_params, 'break_optimization': break_optimization_result}
                         else:
-                            all_solutions[key][model_type] = {'solution': solution, 'requirements': requirements_to_store, 'cost': (None, None, None), 'virtual_shifts_used': virtual_shifts, 'forecast_df': full_staffing_df, 'forecast_params': forecast_params}
+                            all_solutions[key][model_type] = {'solution': solution, 'requirements': requirements_to_store, 'cost': (None, None, None), 'virtual_shifts_used': virtual_shifts, 'forecast_df': full_staffing_df, 'forecast_params': forecast_params, 'break_optimization': None}
 
                 else: # "Optimize Shifts Automatically"
                     optimization_config = {
@@ -3600,7 +4999,16 @@ with tab3:
                     }
                     summary_kpi_df = pd.DataFrame(kpi_data).set_index("Metric")
                     st.dataframe(summary_kpi_df.style.format({
-                        'Value': lambda x: f"${x:,.2f}" if "Cost" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0] else (f"{x:.2%}" if "Coverage" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0] else (f"{x:.2f}%" if "Adherence" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0] else f"{x:,.1f}"))
+                        'Value': lambda x: (
+                            f"${x:,.2f}" if len(summary_kpi_df.loc[summary_kpi_df['Value'] == x]) > 0 and "Cost" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0]
+                            else (
+                                f"{x:.2%}" if len(summary_kpi_df.loc[summary_kpi_df['Value'] == x]) > 0 and "Coverage" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0]
+                                else (
+                                    f"{x:.2f}%" if len(summary_kpi_df.loc[summary_kpi_df['Value'] == x]) > 0 and "Adherence" in summary_kpi_df.loc[summary_kpi_df['Value'] == x].index[0]
+                                    else f"{x:,.1f}"
+                                )
+                            )
+                        )
                     }), use_container_width=True)
 
                     st.markdown("###### Cost Breakdown")
